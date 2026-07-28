@@ -8,7 +8,7 @@ HNewhere detects Hacker News stories, loads comments into a sidebar, and lets yo
 
 ## Install
 
-[Install HNewhere](https://github.com/twalichiewicz/HNewhere/raw/refs/heads/main/HNewhere.user.js)
+[Install HNewhere](https://raw.githubusercontent.com/twalichiewicz/HNewhere/refs/heads/main/HNewhere.user.js)
 
 _Requires a userscript manager such as Tampermonkey, Violentmonkey, or Userscripts._
 
