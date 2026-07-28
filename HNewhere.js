@@ -37,19 +37,19 @@
   };
 
   let sidebar = null;
+  let opening = false;
 
   // -------------------------
   // Storage
   // -------------------------
 
   async function save(key, value) {
-    await GM.setValue(key, JSON.stringify(value));
+    await GM.setValue(key, value);
   }
 
   async function load(key, fallback) {
     try {
-      const value = await GM.getValue(key);
-      return value ? JSON.parse(value) : fallback;
+      return await GM.getValue(key, fallback);
     } catch {
       return fallback;
     }
@@ -86,17 +86,28 @@
   }
 
   async function findHN(url) {
-    const result = await request(
-      "https://hn.algolia.com/api/v1/search?query=" + encodeURIComponent(url),
-    );
-
-    if (!result || !result.hits) return null;
-
     const target = normalizeURL(url);
 
-    const exact = result.hits.find((item) => normalizeURL(item.url) === target);
+    const queries = [url, target];
 
-    return exact ? exact.objectID : null;
+    for (const query of queries) {
+      const result = await request(
+        "https://hn.algolia.com/api/v1/search?tags=story&restrictSearchableAttributes=url&query=" +
+          encodeURIComponent(query),
+      );
+
+      if (!result || !result.hits) continue;
+
+      const exact = result.hits.find(
+        (item) => normalizeURL(item.url) === target,
+      );
+
+      if (exact) {
+        return exact.objectID;
+      }
+    }
+
+    return null;
   }
 
   // -------------------------
@@ -107,7 +118,21 @@
     try {
       const u = new URL(url);
 
-      return (u.hostname + u.pathname.replace(/\/$/, "")).toLowerCase();
+      [
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "fbclid",
+        "gclid",
+      ].forEach((param) => u.searchParams.delete(param));
+
+      return (
+        u.hostname +
+        u.pathname.replace(/\/$/, "") +
+        u.search
+      ).toLowerCase();
     } catch {
       return "";
     }
@@ -125,6 +150,16 @@
       for (const attr of [...el.attributes]) {
         if (attr.name.startsWith("on")) {
           el.removeAttribute(attr.name);
+        }
+      }
+
+      el.removeAttribute("style");
+
+      for (const attr of ["href", "src"]) {
+        const value = el.getAttribute(attr);
+
+        if (value && /^(javascript|data):/i.test(value)) {
+          el.removeAttribute(attr);
         }
       }
     });
@@ -267,7 +302,9 @@
       sidebar = null;
     }
 
-    const width = await load(STORAGE.width, 420);
+    const savedWidth = await load(STORAGE.width, 420);
+
+    const width = Math.min(Math.max(savedWidth, 280), window.innerWidth * 0.8);
 
     const host = document.createElement("div");
     document.body.appendChild(host);
@@ -289,7 +326,7 @@
     max-width:80vw;
     background:#f6f6ef;
     color:#000;
-    z-index:999999;
+    z-index:2147483646;
     display:flex;
     flex-direction:column;
     border-left:1px solid #ccc;
@@ -450,6 +487,8 @@ Loading...
       e.preventDefault();
     });
 
+    let resizeTimer;
+
     const onMouseMove = (e) => {
       if (!resizing) return;
 
@@ -462,7 +501,13 @@ Loading...
 
       panel.style.width = newWidth + "px";
 
-      save(STORAGE.width, newWidth).catch(console.error);
+      clearTimeout(resizeTimer);
+
+      resizeTimer = setTimeout(() => {
+        if (!destroyed) {
+          save(STORAGE.width, newWidth);
+        }
+      }, 250);
     };
 
     const onMouseUp = () => {
@@ -479,7 +524,11 @@ Loading...
     document.addEventListener("mousemove", onMouseMove);
     document.addEventListener("mouseup", onMouseUp);
 
+    let destroyed = false;
+
     host._cleanup = () => {
+      destroyed = true;
+      clearTimeout(resizeTimer);
       document.removeEventListener("mousemove", onMouseMove);
       document.removeEventListener("mouseup", onMouseUp);
     };
@@ -632,8 +681,12 @@ ${sanitizeHTML(comment.text) || ""}
       openHNWindow(reply);
     };
 
-    for (const child of replies) {
-      await renderComment(child, children, storyID);
+    for (let i = 0; i < replies.length; i++) {
+      await renderComment(replies[i], children, storyID);
+
+      if (i > 0 && i % 10 === 0) {
+        await new Promise(requestAnimationFrame);
+      }
     }
   }
 
@@ -669,9 +722,18 @@ ${sanitizeHTML(comment.text) || ""}
   // -------------------------
 
   async function openSidebar(id) {
-    const ui = await createSidebar();
+    if (opening) return;
 
-    await loadDiscussion(id, ui);
+    opening = true;
+
+    try {
+      const ui = await createSidebar();
+      await loadDiscussion(id, ui);
+    } catch (e) {
+      console.error(e);
+    } finally {
+      opening = false;
+    }
   }
 
   // -------------------------
@@ -693,11 +755,11 @@ ${sanitizeHTML(comment.text) || ""}
 
           console.log("Saving HN story:", id, link.href);
 
-          await save(STORAGE.last, {
+          save(STORAGE.last, {
             url: link.href,
             id: id,
             timestamp: Date.now(),
-          });
+          }).catch(console.error);
         } catch (e) {
           console.error("Failed saving HN story:", e);
         }
@@ -729,7 +791,12 @@ ${sanitizeHTML(comment.text) || ""}
 
     // Check if we arrived here by clicking
     // a story from Hacker News.
-    const last = await load(STORAGE.last, null);
+    let last = await load(STORAGE.last, null);
+
+    if (last && Date.now() - last.timestamp > 60000) {
+      await save(STORAGE.last, null);
+      last = null;
+    }
 
     console.log("Stored HN click:", last);
     console.log("Current URL:", location.href);
