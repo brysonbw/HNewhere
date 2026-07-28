@@ -3,9 +3,10 @@
 // @namespace    https://github.com/twalichiewicz/HNewhere
 // @version      1.3
 // @description  Hacker News comments sidebar for any article
-// @match        https://news.ycombinator.com/*
 // @include      http://*
 // @include      https://*
+// @exclude http://localhost/*
+// @exclude https://localhost/*
 // @exclude      https://www.google.com/*
 // @exclude      https://www.google.*/*
 // @exclude      https://*.google.com/*
@@ -13,6 +14,10 @@
 // @exclude      https://mail.google.com/*
 // @exclude      https://mail.*.*/*
 // @exclude      https://*.bank.com/*
+// @exclude      https://*.googleusercontent.com/*
+// @exclude      https://*.doubleclick.net/*
+// @exclude      https://*.facebook.com/*
+// @exclude      https://*.twitter.com/*
 // @grant        GM.getValue
 // @grant        GM.setValue
 // @grant        GM.xmlHttpRequest
@@ -187,12 +192,11 @@
   // -------------------------
 
   function createRestoreButton() {
-    let button = document.getElementById("hn-mini-button");
-
+    let button = document.getElementById("hn-restore-button");
     if (button) return button;
 
     button = document.createElement("button");
-    button.id = "hn-mini-button";
+    button.id = "hn-restore-button";
     button.textContent = "HN";
 
     button.style.cssText = `
@@ -218,14 +222,11 @@
   }
 
   function createCollapsedButton(id) {
-    let button = document.getElementById("hn-mini-button");
-
+    let button = document.getElementById("hn-collapse-button");
     if (button) return button;
 
     button = document.createElement("button");
-
-    button.id = "hn-mini-button";
-
+    button.id = "hn-collapse-button";
     button.textContent = "HN";
 
     button.style.cssText = `
@@ -247,7 +248,7 @@
 
     button.onclick = () => {
       button.remove();
-      openSidebar(id);
+      openSidebar(id).catch(console.error);
     };
 
     document.body.appendChild(button);
@@ -260,20 +261,22 @@
   // -------------------------
 
   async function createSidebar() {
-    if (sidebar) sidebar.remove();
+    if (sidebar) {
+      sidebar._cleanup?.();
+      sidebar.remove();
+      sidebar = null;
+    }
+
+    const width = await load(STORAGE.width, 420);
 
     const host = document.createElement("div");
-
     document.body.appendChild(host);
 
     const shadow = host.attachShadow({
       mode: "open",
     });
 
-    const width = await load(STORAGE.width, 420);
-
     shadow.innerHTML = `
-
 <style>
 
 #panel {
@@ -282,16 +285,17 @@
     top:0;
     height:100vh;
     width:${width}px;
+    min-width:280px;
+    max-width:80vw;
     background:#f6f6ef;
     color:#000;
-    z-index:2147483647;
+    z-index:999999;
     display:flex;
     flex-direction:column;
     border-left:1px solid #ccc;
     box-shadow:-3px 0 12px rgba(0,0,0,.15);
     font-family:-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji", "Segoe UI Symbol";
     font-size:13px;
-
 }
 
 header {
@@ -302,7 +306,6 @@ header {
     justify-content:space-between;
     align-items:center;
     font-weight:bold;
-
 }
 
 header button {
@@ -311,15 +314,13 @@ header button {
     color:black;
     cursor:pointer;
     font-size:16px;
-
 }
 
 #comments {
     overflow:auto;
     overflow-x:hidden;
-    padding: 8px 12px;
+    padding:8px 12px;
     word-wrap:break-word;
-
 }
 
 .comment {
@@ -336,7 +337,6 @@ header button {
     margin-top:4px;
     line-height:132%;
     font-weight:normal;
-
 }
 
 .text p {
@@ -366,14 +366,12 @@ header button {
 }
 
 .hidden {
-  display:none;
+    display:none;
 }
 
 .story-title {
     font-size:15px;
 }
-
-
 
 .story-title a {
     color:#000;
@@ -394,8 +392,8 @@ header button {
     font-family:Verdana, Geneva, sans-serif;
     font-size:11px;
     cursor:pointer;
-
 }
+
 </style>
 
 <div id="panel">
@@ -412,14 +410,11 @@ header button {
 
 </header>
 
-
 <div id="comments">
 Loading...
 </div>
 
-
 </div>
-
 `;
 
     const panel = shadow.querySelector("#panel");
@@ -442,11 +437,10 @@ Loading...
       }
     });
 
-    panel.addEventListener("click", (e) => {
+    panel.addEventListener("mousedown", (e) => {
       if (e.offsetX >= 8) return;
 
       resizing = true;
-
       startX = e.clientX;
       startWidth = panel.offsetWidth;
 
@@ -460,9 +454,14 @@ Loading...
       if (!resizing) return;
 
       const delta = startX - e.clientX;
-      const newWidth = startWidth + delta;
+
+      const newWidth = Math.min(
+        Math.max(startWidth + delta, 280),
+        window.innerWidth * 0.8,
+      );
 
       panel.style.width = newWidth + "px";
+
       save(STORAGE.width, newWidth).catch(console.error);
     };
 
@@ -480,6 +479,11 @@ Loading...
     document.addEventListener("mousemove", onMouseMove);
     document.addEventListener("mouseup", onMouseUp);
 
+    host._cleanup = () => {
+      document.removeEventListener("mousemove", onMouseMove);
+      document.removeEventListener("mouseup", onMouseUp);
+    };
+
     shadow.querySelector("#minimize").onclick = () => {
       host.style.display = "none";
 
@@ -487,22 +491,18 @@ Loading...
 
       restore.onclick = () => {
         host.style.display = "block";
-
         restore.remove();
       };
     };
 
-    if (sidebar) sidebar.remove();
-
-    const oldButton = document.getElementById("hn-mini-button");
-
-    if (oldButton) oldButton.remove();
+    document
+      .querySelectorAll("#hn-restore-button, #hn-collapse-button")
+      .forEach((button) => button.remove());
 
     sidebar = host;
 
     return {
       shadow,
-
       body: shadow.querySelector("#comments"),
     };
   }
@@ -562,19 +562,20 @@ add comment
   // Comment rendering
   // -------------------------
 
-  function renderComment(id, container, storyID) {
-    return getItem(id).then((comment) => {
-      if (!comment || comment.deleted || comment.dead) return;
+  async function renderComment(id, container, storyID) {
+    const comment = await getItem(id);
 
-      const div = document.createElement("div");
+    if (!comment || comment.deleted || comment.dead) return;
 
-      div.className = "comment";
+    const div = document.createElement("div");
 
-      const replies = comment.kids || [];
+    div.className = "comment";
 
-      const reply = replyURL(comment, storyID);
+    const replies = comment.kids || [];
 
-      div.innerHTML = `
+    const reply = replyURL(comment, storyID);
+
+    div.innerHTML = `
 
 <div class="meta">
 
@@ -609,32 +610,31 @@ ${sanitizeHTML(comment.text) || ""}
 
 `;
 
-      container.appendChild(div);
+    container.appendChild(div);
 
-      const children = div.querySelector(".children");
+    const children = div.querySelector(".children");
 
-      const toggle = div.querySelector(".toggle");
+    const toggle = div.querySelector(".toggle");
 
-      toggle.onclick = () => {
-        children.classList.toggle("hidden");
+    toggle.onclick = () => {
+      children.classList.toggle("hidden");
 
-        toggle.textContent = children.classList.contains("hidden")
-          ? "[+]"
-          : "[–]";
-      };
+      toggle.textContent = children.classList.contains("hidden")
+        ? "[+]"
+        : "[–]";
+    };
 
-      const replyButton = div.querySelector(".reply-link");
+    const replyButton = div.querySelector(".reply-link");
 
-      replyButton.onclick = function (event) {
-        event.preventDefault();
+    replyButton.onclick = function (event) {
+      event.preventDefault();
 
-        openHNWindow(reply);
-      };
+      openHNWindow(reply);
+    };
 
-      for (const child of replies) {
-        renderComment(child, children, storyID);
-      }
-    });
+    for (const child of replies) {
+      await renderComment(child, children, storyID);
+    }
   }
 
   // -------------------------
@@ -682,27 +682,25 @@ ${sanitizeHTML(comment.text) || ""}
     document.addEventListener(
       "click",
       async function (event) {
-        const link = event.target.closest("a");
+        try {
+          const link = event.target.closest("a");
+          if (!link) return;
+          const row = link.closest("tr.athing");
+          if (!row) return;
+          if (!link.closest(".titleline")) return;
+          const id = row.id;
+          if (!id) return;
 
-        if (!link) return;
+          console.log("Saving HN story:", id, link.href);
 
-        const row = link.closest("tr.athing");
-
-        if (!row) return;
-
-        if (!link.closest(".titleline")) return;
-
-        const id = row.id;
-
-        if (!id) return;
-
-        console.log("Saving HN story:", id, link.href);
-
-        await save(STORAGE.last, {
-          url: link.href,
-          id: id,
-          timestamp: Date.now(),
-        });
+          await save(STORAGE.last, {
+            url: link.href,
+            id: id,
+            timestamp: Date.now(),
+          });
+        } catch (e) {
+          console.error("Failed saving HN story:", e);
+        }
       },
       true,
     );
@@ -763,5 +761,5 @@ ${sanitizeHTML(comment.text) || ""}
     }
   }
 
-  init();
+  init().catch(console.error);
 })();
