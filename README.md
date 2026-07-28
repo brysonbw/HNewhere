@@ -1,5 +1,8 @@
 # HNewhere
 
+<img width="1085" height="1006" alt="SCR-20260728-ndit" src="https://github.com/user-attachments/assets/e5d46dba-d099-416c-a10a-0177c403ff56" />
+
+
 A lightweight userscript that adds Hacker News discussions to any article.
 
 HNewhere detects Hacker News stories, loads comments into a sidebar, and lets you browse discussions without leaving the page.
