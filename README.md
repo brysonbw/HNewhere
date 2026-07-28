@@ -24,7 +24,7 @@ HNewhere detects Hacker News stories, loads comments into a sidebar, and lets yo
    - Tampermonkey
    - Violentmonkey
 
-2. Install `HNewhere.user.js`
+2. Install or paste `HNewhere.js`
 
 3. Visit an article with a Hacker News discussion.
 
