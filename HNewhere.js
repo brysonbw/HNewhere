@@ -13,192 +13,189 @@
 // @exclude      https://mail.google.com/*
 // @exclude      https://mail.*.*/*
 // @exclude      https://*.bank.com/*
-// @grant        GM_xmlhttpRequest
-// @grant        GM_setValue
-// @grant        GM_getValue
+// @grant        GM.getValue
+// @grant        GM.setValue
+// @grant        GM.xmlHttpRequest
 // @connect      hacker-news.firebaseio.com
 // @connect      hn.algolia.com
 // @run-at       document-end
+// @noframes
 // ==/UserScript==
 
 (function () {
-	"use strict";
+  "use strict";
 
-	const STORAGE = {
-		width: "hn_width",
+  const STORAGE = {
+    width: "hn_width",
 
-		last: "hn_last",
-	};
+    last: "hn_last",
+  };
 
-	let sidebar = null;
+  let sidebar = null;
 
-	// -------------------------
-	// Storage
-	// -------------------------
+  // -------------------------
+  // Storage
+  // -------------------------
 
-	function save(key, value) {
-		GM_setValue(key, JSON.stringify(value));
-	}
+  async function save(key, value) {
+    await GM.setValue(key, JSON.stringify(value));
+  }
 
-	function load(key, fallback) {
-		try {
-			const value = GM_getValue(key);
+  async function load(key, fallback) {
+    try {
+      const value = await GM.getValue(key);
+      return value ? JSON.parse(value) : fallback;
+    } catch {
+      return fallback;
+    }
+  }
 
-			return value ? JSON.parse(value) : fallback;
-		} catch {
-			return fallback;
-		}
-	}
+  // -------------------------
+  // Network
+  // -------------------------
 
-	// -------------------------
-	// Network
-	// -------------------------
+  function request(url) {
+    return new Promise((resolve, reject) => {
+      GM.xmlHttpRequest({
+        method: "GET",
 
-	function request(url) {
-		return new Promise((resolve, reject) => {
-			GM_xmlhttpRequest({
-				method: "GET",
+        url: url,
 
-				url: url,
+        onload: function (response) {
+          try {
+            resolve(JSON.parse(response.responseText));
+          } catch {
+            resolve(null);
+          }
+        },
 
-				onload: function (response) {
-					try {
-						resolve(JSON.parse(response.responseText));
-					} catch {
-						resolve(null);
-					}
-				},
+        onerror: reject,
+      });
+    });
+  }
 
-				onerror: reject,
-			});
-		});
-	}
+  async function getItem(id) {
+    return request(
+      "https://hacker-news.firebaseio.com/v0/item/" + id + ".json",
+    );
+  }
 
-	async function getItem(id) {
-		return request(
-			"https://hacker-news.firebaseio.com/v0/item/" + id + ".json",
-		);
-	}
+  async function findHN(url) {
+    const result = await request(
+      "https://hn.algolia.com/api/v1/search?query=" + encodeURIComponent(url),
+    );
 
-	async function findHN(url) {
-		const result = await request(
-			"https://hn.algolia.com/api/v1/search?query=" +
-				encodeURIComponent(url),
-		);
+    if (!result || !result.hits) return null;
 
-		if (!result || !result.hits) return null;
+    const target = normalizeURL(url);
 
-		const target = normalizeURL(url);
+    const exact = result.hits.find((item) => normalizeURL(item.url) === target);
 
-		const exact = result.hits.find(
-			(item) => normalizeURL(item.url) === target
-		);
+    return exact ? exact.objectID : null;
+  }
 
-		return exact ? exact.objectID : null;
-	}
+  // -------------------------
+  // Helpers
+  // -------------------------
 
-	// -------------------------
-	// Helpers
-	// -------------------------
+  function normalizeURL(url) {
+    try {
+      const u = new URL(url);
 
-	function normalizeURL(url) {
-		try {
-			const u = new URL(url);
-
-			return (u.hostname + u.pathname.replace(/\/$/, "")).toLowerCase();
-		} catch {
-			return "";
-		}
+      return (u.hostname + u.pathname.replace(/\/$/, "")).toLowerCase();
+    } catch {
+      return "";
+    }
   }
 
   function sanitizeHTML(html) {
-	const template = document.createElement("template");
-	template.innerHTML = html || "";
+    const template = document.createElement("template");
+    template.innerHTML = html || "";
 
-	template.content.querySelectorAll(
-		"script, iframe, object, embed"
-	).forEach((el) => el.remove());
+    template.content
+      .querySelectorAll("script, iframe, object, embed")
+      .forEach((el) => el.remove());
 
-	template.content.querySelectorAll("*").forEach((el) => {
-		for (const attr of [...el.attributes]) {
-			if (attr.name.startsWith("on")) {
-				el.removeAttribute(attr.name);
-			}
-		}
-	});
+    template.content.querySelectorAll("*").forEach((el) => {
+      for (const attr of [...el.attributes]) {
+        if (attr.name.startsWith("on")) {
+          el.removeAttribute(attr.name);
+        }
+      }
+    });
 
-	return template.innerHTML;
+    return template.innerHTML;
   }
 
-	function escapeHTML(value) {
-		return String(value || "")
-			.replace(/&/g, "&amp;")
-			.replace(/</g, "&lt;")
-			.replace(/>/g, "&gt;")
-			.replace(/"/g, "&quot;");
-	}
+  function escapeHTML(value) {
+    return String(value || "")
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;");
+  }
 
-	function timeAgo(timestamp) {
-		if (!timestamp) return "";
+  function timeAgo(timestamp) {
+    if (!timestamp) return "";
 
-		const seconds = Math.floor(Date.now() / 1000 - timestamp);
+    const seconds = Math.floor(Date.now() / 1000 - timestamp);
 
-		if (seconds < 60) return "just now";
+    if (seconds < 60) return "just now";
 
-		const minutes = Math.floor(seconds / 60);
+    const minutes = Math.floor(seconds / 60);
 
-		if (minutes < 60) return minutes + " minutes ago";
+    if (minutes < 60) return minutes + " minutes ago";
 
-		const hours = Math.floor(minutes / 60);
+    const hours = Math.floor(minutes / 60);
 
-		if (hours < 24) return hours + " hours ago";
+    if (hours < 24) return hours + " hours ago";
 
-		const days = Math.floor(hours / 24);
+    const days = Math.floor(hours / 24);
 
-		return days === 1 ? "1 day ago" : days + " days ago";
-	}
+    return days === 1 ? "1 day ago" : days + " days ago";
+  }
 
-	// -------------------------
-	// Popup helpers
-	// -------------------------
+  // -------------------------
+  // Popup helpers
+  // -------------------------
 
-	function openHNWindow(url) {
-		window.open(
-			url,
-			"hn_popup",
-			"width=760,height=700,resizable=yes,scrollbars=yes",
-		);
-	}
+  function openHNWindow(url) {
+    window.open(
+      url,
+      "hn_popup",
+      "width=760,height=700,resizable=yes,scrollbars=yes",
+    );
+  }
 
-	function replyURL(comment, storyID) {
-		return (
-			"https://news.ycombinator.com/reply?id=" +
-			comment.id +
-			"&goto=item%3Fid%3D" +
-			storyID +
-			"%23" +
-			comment.id
-		);
-	}
+  function replyURL(comment, storyID) {
+    return (
+      "https://news.ycombinator.com/reply?id=" +
+      comment.id +
+      "&goto=item%3Fid%3D" +
+      storyID +
+      "%23" +
+      comment.id
+    );
+  }
 
-	function commentURL(storyID) {
-		return "https://news.ycombinator.com/item?id=" + storyID;
-	}
+  function commentURL(storyID) {
+    return "https://news.ycombinator.com/item?id=" + storyID;
+  }
 
-	// -------------------------
-	// Restore button
-	// -------------------------
+  // -------------------------
+  // Restore button
+  // -------------------------
 
-	function createRestoreButton() {
-		let button = document.getElementById("hn-mini-button");
+  function createRestoreButton() {
+    let button = document.getElementById("hn-mini-button");
 
-		if (button) return button;
+    if (button) return button;
 
-		button = document.createElement("button");
-		button.id = "hn-mini-button";
+    button = document.createElement("button");
+    button.id = "hn-mini-button";
     button.textContent = "HN";
 
-		button.style.cssText = `
+    button.style.cssText = `
         position:fixed;
         top:12px;
         right:12px;
@@ -215,23 +212,23 @@
         box-shadow:0 1px 4px rgba(0,0,0,.25);
     `;
 
-		document.body.appendChild(button);
+    document.body.appendChild(button);
 
-		return button;
+    return button;
   }
 
   function createCollapsedButton(id) {
-	let button = document.getElementById("hn-mini-button");
+    let button = document.getElementById("hn-mini-button");
 
-	if (button) return button;
+    if (button) return button;
 
-	button = document.createElement("button");
+    button = document.createElement("button");
 
-	button.id = "hn-mini-button";
+    button.id = "hn-mini-button";
 
-	button.textContent = "HN";
+    button.textContent = "HN";
 
-	button.style.cssText = `
+    button.style.cssText = `
 		position:fixed;
 		top:12px;
 		right:12px;
@@ -248,34 +245,34 @@
 		box-shadow:0 1px 4px rgba(0,0,0,.25);
 	`;
 
-	button.onclick = () => {
-		button.remove();
-		openSidebar(id);
-	};
+    button.onclick = () => {
+      button.remove();
+      openSidebar(id);
+    };
 
-	document.body.appendChild(button);
+    document.body.appendChild(button);
 
-	return button;
+    return button;
   }
 
-	// -------------------------
-	// Sidebar
-	// -------------------------
+  // -------------------------
+  // Sidebar
+  // -------------------------
 
-	function createSidebar() {
-		if (sidebar) sidebar.remove();
+  async function createSidebar() {
+    if (sidebar) sidebar.remove();
 
-		const host = document.createElement("div");
+    const host = document.createElement("div");
 
-		document.body.appendChild(host);
+    document.body.appendChild(host);
 
-		const shadow = host.attachShadow({
-			mode: "open",
-		});
+    const shadow = host.attachShadow({
+      mode: "open",
+    });
 
-		const width = load(STORAGE.width, 420);
+    const width = await load(STORAGE.width, 420);
 
-		shadow.innerHTML = `
+    shadow.innerHTML = `
 
 <style>
 
@@ -425,99 +422,99 @@ Loading...
 
 `;
 
-		const panel = shadow.querySelector("#panel");
+    const panel = shadow.querySelector("#panel");
 
-		let resizing = false;
-		let startX = 0;
-		let startWidth = 0;
+    let resizing = false;
+    let startX = 0;
+    let startWidth = 0;
 
-		panel.addEventListener("mousemove", (e) => {
-			if (e.offsetX < 8) {
-				panel.style.cursor = "col-resize";
-			} else if (!resizing) {
-				panel.style.cursor = "default";
-			}
-		});
+    panel.addEventListener("mousemove", (e) => {
+      if (e.offsetX < 8) {
+        panel.style.cursor = "col-resize";
+      } else if (!resizing) {
+        panel.style.cursor = "default";
+      }
+    });
 
-		panel.addEventListener("mouseleave", () => {
-			if (!resizing) {
-				panel.style.cursor = "default";
-			}
-		});
+    panel.addEventListener("mouseleave", () => {
+      if (!resizing) {
+        panel.style.cursor = "default";
+      }
+    });
 
-		panel.addEventListener("mousedown", (e) => {
-			if (e.offsetX >= 8) return;
+    panel.addEventListener("click", (e) => {
+      if (e.offsetX >= 8) return;
 
-			resizing = true;
+      resizing = true;
 
-			startX = e.clientX;
-			startWidth = panel.offsetWidth;
+      startX = e.clientX;
+      startWidth = panel.offsetWidth;
 
-			document.body.style.userSelect = "none";
-			document.body.style.cursor = "col-resize";
+      document.body.style.userSelect = "none";
+      document.body.style.cursor = "col-resize";
 
-			e.preventDefault();
-		});
+      e.preventDefault();
+    });
 
-		const onMouseMove = (e) => {
-			if (!resizing) return;
+    const onMouseMove = (e) => {
+      if (!resizing) return;
 
-			const delta = startX - e.clientX;
-			const newWidth = startWidth + delta;
+      const delta = startX - e.clientX;
+      const newWidth = startWidth + delta;
 
-			panel.style.width = newWidth + "px";
-			save(STORAGE.width, newWidth);
-		};
+      panel.style.width = newWidth + "px";
+      save(STORAGE.width, newWidth).catch(console.error);
+    };
 
-		const onMouseUp = () => {
-			if (!resizing) return;
+    const onMouseUp = () => {
+      if (!resizing) return;
 
-			resizing = false;
+      resizing = false;
 
-			document.body.style.userSelect = "";
-			document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+      document.body.style.cursor = "";
 
-			panel.style.cursor = "default";
-		};
+      panel.style.cursor = "default";
+    };
 
-		document.addEventListener("mousemove", onMouseMove);
-		document.addEventListener("mouseup", onMouseUp);
+    document.addEventListener("mousemove", onMouseMove);
+    document.addEventListener("mouseup", onMouseUp);
 
-		shadow.querySelector("#minimize").onclick = () => {
-			host.style.display = "none";
+    shadow.querySelector("#minimize").onclick = () => {
+      host.style.display = "none";
 
-			const restore = createRestoreButton();
+      const restore = createRestoreButton();
 
-			restore.onclick = () => {
-				host.style.display = "block";
+      restore.onclick = () => {
+        host.style.display = "block";
 
-				restore.remove();
-			};
-		};
+        restore.remove();
+      };
+    };
 
-		if (sidebar) sidebar.remove();
+    if (sidebar) sidebar.remove();
 
-		const oldButton = document.getElementById("hn-mini-button");
+    const oldButton = document.getElementById("hn-mini-button");
 
-		if (oldButton) oldButton.remove();
+    if (oldButton) oldButton.remove();
 
-		sidebar = host;
+    sidebar = host;
 
-		return {
-			shadow,
+    return {
+      shadow,
 
-			body: shadow.querySelector("#comments"),
-		};
-	}
+      body: shadow.querySelector("#comments"),
+    };
+  }
 
-	// -------------------------
-	// Story rendering
-	// -------------------------
+  // -------------------------
+  // Story rendering
+  // -------------------------
 
-	function renderStory(story, container) {
-		const url = story.url || "https://news.ycombinator.com/item?id=" + story.id;
+  function renderStory(story, container) {
+    const url = story.url || "https://news.ycombinator.com/item?id=" + story.id;
 
-		container.innerHTML = `
+    container.innerHTML = `
 
 <div class="story">
 
@@ -556,28 +553,28 @@ add comment
 
 `;
 
-		container.querySelector(".add-comment").onclick = () => {
-			openHNWindow(commentURL(story.id));
-		};
-	}
+    container.querySelector(".add-comment").onclick = () => {
+      openHNWindow(commentURL(story.id));
+    };
+  }
 
-	// -------------------------
-	// Comment rendering
-	// -------------------------
+  // -------------------------
+  // Comment rendering
+  // -------------------------
 
-	function renderComment(id, container, storyID) {
-		getItem(id).then((comment) => {
-			if (!comment || comment.deleted || comment.dead) return;
+  function renderComment(id, container, storyID) {
+    return getItem(id).then((comment) => {
+      if (!comment || comment.deleted || comment.dead) return;
 
-			const div = document.createElement("div");
+      const div = document.createElement("div");
 
-			div.className = "comment";
+      div.className = "comment";
 
-			const replies = comment.kids || [];
+      const replies = comment.kids || [];
 
-			const reply = replyURL(comment, storyID);
+      const reply = replyURL(comment, storyID);
 
-			div.innerHTML = `
+      div.innerHTML = `
 
 <div class="meta">
 
@@ -612,180 +609,159 @@ ${sanitizeHTML(comment.text) || ""}
 
 `;
 
-			container.appendChild(div);
+      container.appendChild(div);
 
-			const children = div.querySelector(".children");
+      const children = div.querySelector(".children");
 
-			const toggle = div.querySelector(".toggle");
+      const toggle = div.querySelector(".toggle");
 
-			toggle.onclick = () => {
-				children.classList.toggle("hidden");
+      toggle.onclick = () => {
+        children.classList.toggle("hidden");
 
-				toggle.textContent = children.classList.contains("hidden")
-					? "[+]"
-					: "[–]";
-			};
+        toggle.textContent = children.classList.contains("hidden")
+          ? "[+]"
+          : "[–]";
+      };
 
-			const replyButton = div.querySelector(".reply-link");
+      const replyButton = div.querySelector(".reply-link");
 
-			replyButton.onclick = function (event) {
-				event.preventDefault();
+      replyButton.onclick = function (event) {
+        event.preventDefault();
 
-				openHNWindow(reply);
-			};
+        openHNWindow(reply);
+      };
 
-			for (const child of replies) {
-				renderComment(child, children, storyID);
-			}
-		});
-	}
+      for (const child of replies) {
+        renderComment(child, children, storyID);
+      }
+    });
+  }
 
-	// -------------------------
-	// Discussion loading
-	// -------------------------
+  // -------------------------
+  // Discussion loading
+  // -------------------------
 
-	async function loadDiscussion(id, ui) {
+  async function loadDiscussion(id, ui) {
+    const story = await getItem(id);
 
-		const story = await getItem(id);
+    if (!story) {
+      ui.body.textContent = "Unable to load HN discussion.";
+      return;
+    }
 
-		if (!story) {
-			ui.body.textContent = "Unable to load HN discussion.";
-			return;
-		}
+    renderStory(story, ui.body);
 
-		renderStory(story, ui.body);
+    const comments = document.createElement("div");
 
-		const comments = document.createElement("div");
+    comments.className = "top-level-comments";
 
-		comments.className = "top-level-comments";
+    ui.body.appendChild(comments);
 
-		ui.body.appendChild(comments);
+    const kids = story.kids || [];
 
-		const kids = story.kids || [];
+    for (const child of kids) {
+      await renderComment(child, comments, story.id);
+    }
+  }
 
-		for (const child of kids) {
-			await renderComment(child, comments, story.id);
-		}
-	}
+  // -------------------------
+  // Open sidebar
+  // -------------------------
 
-	// -------------------------
-	// Open sidebar
-	// -------------------------
+  async function openSidebar(id) {
+    const ui = await createSidebar();
 
-	async function openSidebar(id) {
-		const ui = createSidebar();
+    await loadDiscussion(id, ui);
+  }
 
-		await loadDiscussion(id, ui);
-	}
+  // -------------------------
+  // Hacker News click tracking
+  // -------------------------
 
-	// -------------------------
-	// Hacker News click tracking
-	// -------------------------
+  function setupHNListener() {
+    document.addEventListener(
+      "click",
+      async function (event) {
+        const link = event.target.closest("a");
 
-	function setupHNListener() {
-		document.addEventListener(
-			"mousedown",
-			function (event) {
-				const link = event.target.closest("a");
+        if (!link) return;
 
-				if (!link) return;
+        const row = link.closest("tr.athing");
 
-				const row = link.closest("tr.athing");
+        if (!row) return;
 
-				if (!row) return;
+        if (!link.closest(".titleline")) return;
 
-				if (!link.closest(".titleline")) return;
+        const id = row.id;
 
-				const id = row.id;
+        if (!id) return;
 
-				if (!id) return;
+        console.log("Saving HN story:", id, link.href);
 
-				console.log(
-					"Saving HN story:",
-					id,
-					link.href
-				);
+        await save(STORAGE.last, {
+          url: link.href,
+          id: id,
+          timestamp: Date.now(),
+        });
+      },
+      true,
+    );
+  }
 
-				save(STORAGE.last, {
-					url: link.href,
-					id: id,
-					timestamp: Date.now(),
-				});
-			},
-			true
-		);
-	}
+  // -------------------------
+  // URL helpers
+  // -------------------------
 
-	// -------------------------
-	// URL helpers
-	// -------------------------
+  function sameURL(a, b) {
+    return normalizeURL(a) === normalizeURL(b);
+  }
 
-	function sameURL(a, b) {
-		return normalizeURL(a) === normalizeURL(b);
-	}
-	
-		// -------------------------
-	// Initialization
-	// -------------------------
+  // -------------------------
+  // Initialization
+  // -------------------------
 
-	async function init() {
-		console.log(
-			"HNewhere sidebar loaded",
-			location.href
-		);
+  async function init() {
+    console.log("HNewhere sidebar loaded", location.href);
 
-		// On HN, only record clicked stories.
-		if (
-			location.hostname === "news.ycombinator.com"
-		) {
-			setupHNListener();
-			return;
-		}
+    // On HN, only record clicked stories.
+    if (location.hostname === "news.ycombinator.com") {
+      setupHNListener();
+      return;
+    }
 
+    // Check if we arrived here by clicking
+    // a story from Hacker News.
+    const last = await load(STORAGE.last, null);
 
-		// Check if we arrived here by clicking
-		// a story from Hacker News.
-		const last = load(
-			STORAGE.last,
-			null
-		);
+    console.log("Stored HN click:", last);
+    console.log("Current URL:", location.href);
+    console.log("Same URL:", last && sameURL(last.url, location.href));
+    console.log("Age:", last ? Date.now() - last.timestamp : null);
 
+    if (
+      last &&
+      sameURL(last.url, location.href) &&
+      Date.now() - last.timestamp < 60000
+    ) {
+      console.log("Opening HN discussion from click:", last.id);
 
-		if (
-			last &&
-			sameURL(last.url, location.href) &&
-			Date.now() - last.timestamp < 60000
-		) {
-			console.log(
-				"Opening HN discussion from click:",
-				last.id
-			);
+      await save(STORAGE.last, null);
 
-			save(STORAGE.last, null);
+      await openSidebar(last.id);
 
-			openSidebar(last.id);
+      return;
+    }
 
-			return;
-		}
+    // Otherwise, silently check if this URL
+    // already has an HN discussion.
+    const id = await findHN(location.href);
 
+    if (id) {
+      console.log("Found HN discussion:", id);
 
-		// Otherwise, silently check if this URL
-		// already has an HN discussion.
-		const id = await findHN(
-			location.href
-		);
+      createCollapsedButton(id);
+    }
+  }
 
-
-		if (id) {
-			console.log(
-				"Found HN discussion:",
-				id
-			);
-
-			createCollapsedButton(id);
-		}
-	}
-
-
-	init();
+  init();
 })();
