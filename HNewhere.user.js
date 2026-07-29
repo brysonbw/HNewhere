@@ -9,6 +9,7 @@
 // @exclude https://localhost/*
 // @exclude      https://www.google.com/*
 // @exclude      https://www.google.*/*
+// @exclude      https://chatgpt.com/*
 // @exclude      https://*.google.com/*
 // @exclude      https://accounts.google.com/*
 // @exclude      https://mail.google.com/*
