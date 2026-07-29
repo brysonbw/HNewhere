@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HNewhere
 // @namespace    https://github.com/twalichiewicz/HNewhere
-// @version      1.4
+// @version      1.4.5
 // @description  Hacker News comments sidebar for any article
 // @include      http://*
 // @include      https://*
@@ -33,7 +33,7 @@
 
 	const STORAGE = {
 		width: "hn_width",
-
+		position: "hn_button_position",
 		last: "hn_last",
 	};
 
@@ -201,6 +201,25 @@
 		return days === 1 ? "1 day ago" : days + " days ago";
 	}
 
+	function isMobile() {
+		return window.matchMedia("(max-width: 700px)").matches;
+	}
+
+	function clampButtonPosition(button) {
+		const maxX = window.innerWidth - button.offsetWidth;
+		const maxY = window.innerHeight - button.offsetHeight;
+
+		const currentX = parseInt(button.style.left || button.offsetLeft, 10);
+		const currentY = parseInt(button.style.top || button.offsetTop, 10);
+
+		const x = Math.max(0, Math.min(currentX, maxX));
+		const y = Math.max(0, Math.min(currentY, maxY));
+
+		button.style.left = x + "px";
+		button.style.top = y + "px";
+		button.style.right = "auto";
+	}
+
 	// -------------------------
 	// Popup helpers
 	// -------------------------
@@ -232,7 +251,116 @@
 	// Restore button
 	// -------------------------
 
-	function createRestoreButton() {
+	async function applyButtonPosition(button) {
+		const saved = await load(STORAGE.position, null);
+
+		if (!saved) return;
+
+		const maxX = window.innerWidth - button.offsetWidth;
+		const maxY = window.innerHeight - button.offsetHeight;
+
+		button.style.left = Math.max(0, Math.min(saved.x, maxX)) + "px";
+		button.style.top = Math.max(0, Math.min(saved.y, maxY)) + "px";
+		button.style.right = "auto";
+	}
+
+	function makeButtonDraggable(button) {
+		let dragging = false;
+		let moved = false;
+		let suppressClick = false;
+		let startX = 0;
+		let startY = 0;
+		let startLeft = 0;
+		let startTop = 0;
+
+		const clampPosition = () => {
+			const maxX = window.innerWidth - button.offsetWidth;
+			const maxY = window.innerHeight - button.offsetHeight;
+
+			button.style.left = Math.max(0, Math.min(button.offsetLeft, maxX)) + "px";
+
+			button.style.top = Math.max(0, Math.min(button.offsetTop, maxY)) + "px";
+
+			button.style.right = "auto";
+		};
+
+		window.addEventListener("resize", clampPosition);
+
+		button.addEventListener("pointerdown", (event) => {
+			dragging = true;
+			moved = false;
+
+			startX = event.clientX;
+			startY = event.clientY;
+
+			const rect = button.getBoundingClientRect();
+
+			startLeft = rect.left;
+			startTop = rect.top;
+
+			button.setPointerCapture(event.pointerId);
+		});
+
+		button.addEventListener("pointermove", (event) => {
+			if (!dragging) return;
+
+			const deltaX = event.clientX - startX;
+			const deltaY = event.clientY - startY;
+
+			if (Math.abs(deltaX) > 4 || Math.abs(deltaY) > 4) {
+				moved = true;
+			}
+
+			button.style.left =
+				Math.min(
+					Math.max(0, startLeft + deltaX),
+					window.innerWidth - button.offsetWidth,
+				) + "px";
+
+			button.style.top =
+				Math.min(
+					Math.max(0, startTop + deltaY),
+					window.innerHeight - button.offsetHeight,
+				) + "px";
+
+			button.style.right = "auto";
+		});
+
+		button.addEventListener("pointerup", (event) => {
+			if (!dragging) return;
+
+			dragging = false;
+
+			if (moved) {
+				suppressClick = true;
+
+				save(STORAGE.position, {
+					x: button.offsetLeft,
+					y: button.offsetTop,
+				});
+
+				// Clear after the browser has finished dispatching click.
+				requestAnimationFrame(() => {
+					suppressClick = false;
+				});
+			}
+
+			if (button.hasPointerCapture(event.pointerId)) {
+				button.releasePointerCapture(event.pointerId);
+			}
+		});
+
+		button.addEventListener("click", (event) => {
+			if (suppressClick) {
+				event.preventDefault();
+				event.stopImmediatePropagation();
+			}
+		});
+
+		return () => suppressClick;
+	}
+
+	async function createRestoreButton() {
 		let button = document.getElementById("hn-restore-button");
 		if (button) return button;
 
@@ -255,14 +383,18 @@
         font-weight:bold;
         cursor:pointer;
         box-shadow:0 1px 4px rgba(0,0,0,.25);
+        -webkit-tap-highlight-color: transparent;
     `;
 
 		document.body.appendChild(button);
 
+		await applyButtonPosition(button);
+		makeButtonDraggable(button);
+
 		return button;
 	}
 
-	function createCollapsedButton(stories) {
+	async function createCollapsedButton(stories) {
 		let button = document.getElementById("hn-collapse-button");
 		if (button) return button;
 
@@ -271,28 +403,37 @@
 		button.textContent = "HN";
 
 		button.style.cssText = `
-		position:fixed;
-		top:12px;
-		right:12px;
-		z-index:2147483647;
-		background:#ff6600;
-		color:white;
-		border:none;
-		border-radius:3px;
-		padding:4px 8px;
-		font-family:Verdana,sans-serif;
-		font-size:11px;
-		font-weight:bold;
-		cursor:pointer;
-		box-shadow:0 1px 4px rgba(0,0,0,.25);
-	`;
+			position:fixed;
+			top:12px;
+			right:12px;
+			z-index:2147483647;
+			background:#ff6600;
+			color:white;
+			border:none;
+			border-radius:3px;
+			padding:4px 8px;
+			font-family:Verdana,sans-serif;
+			font-size:11px;
+			font-weight:bold;
+			cursor:pointer;
+			box-shadow:0 1px 4px rgba(0,0,0,.25);
+			user-select:none;
+			touch-action:none;
+			-webkit-tap-highlight-color: transparent;
+		`;
+
+		document.body.appendChild(button);
+
+		await applyButtonPosition(button);
+
+		const wasMoved = makeButtonDraggable(button);
 
 		button.onclick = () => {
+			if (wasMoved()) return;
+
 			button.remove();
 			openSidebar(stories).catch(console.error);
 		};
-
-		document.body.appendChild(button);
 
 		return button;
 	}
@@ -548,10 +689,10 @@ Loading...
 			document.removeEventListener("mouseup", onMouseUp);
 		};
 
-		shadow.querySelector("#minimize").onclick = () => {
+		shadow.querySelector("#minimize").onclick = async () => {
 			host.style.display = "none";
 
-			const restore = createRestoreButton();
+			const restore = await createRestoreButton();
 
 			restore.onclick = () => {
 				host.style.display = "";
@@ -896,7 +1037,15 @@ ${sanitizeHTML(comment.text) || ""}
 				stories.map((s) => s.objectID),
 			);
 
-			createCollapsedButton(stories);
+			if (isMobile()) {
+				await createCollapsedButton(stories);
+			} else {
+				await openSidebar(
+					stories.map((story) => ({
+						objectID: story.objectID,
+					})),
+				);
+			}
 		}
 	}
 
