@@ -577,8 +577,13 @@ Loading...
   // Story rendering
   // -------------------------
 
-  function renderStory(story, container) {
-    const url = story.url || "https://news.ycombinator.com/item?id=" + story.id;
+  function renderStory(story, container, options = {}) {
+      const {
+          multiple = false,
+          stories = []
+      } = options;
+
+      const url = story.url || "https://news.ycombinator.com/item?id=" + story.id;
 
     container.insertAdjacentHTML("beforeend", `
 
@@ -711,32 +716,45 @@ ${sanitizeHTML(comment.text) || ""}
   // Discussion loading
   // -------------------------
 
-  async function loadDiscussion(stories, ui) {
+  async function renderSingleDiscussion(story, ui) {
     ui.body.innerHTML = "";
 
-    for (const summary of stories) {
-      const story = await getItem(summary.objectID);
+    renderStory(story, ui.body);
 
-      if (!story) continue;
+    const comments = document.createElement("div");
+    comments.className = "top-level-comments";
+    ui.body.appendChild(comments);
 
+    for (const child of story.kids || []) {
+      await renderComment(child, comments, story.id);
+    }
+  }
+
+  async function renderBlendedDiscussion(stories, ui) {
+    ui.body.innerHTML = "";
+
+    for (const story of stories) {
       const section = document.createElement("div");
-
       section.className = "submission";
 
       ui.body.appendChild(section);
 
       const header = document.createElement("div");
-
       header.className = "submission-header";
-
-      header.textContent = "Submitted " + timeAgo(story.time);
+      header.textContent =
+        new Date(story.time * 1000).toLocaleDateString(undefined, {
+          year: "numeric",
+          month: "long"
+        });
 
       section.appendChild(header);
 
-      renderStory(story, section);
+      renderStory(story, section, {
+          multiple: true,
+          stories
+      });
 
       const comments = document.createElement("div");
-
       comments.className = "top-level-comments";
 
       section.appendChild(comments);
@@ -745,6 +763,21 @@ ${sanitizeHTML(comment.text) || ""}
         await renderComment(child, comments, story.id);
       }
     }
+  }
+
+  async function loadStories(stories) {
+    const loaded = [];
+
+    for (const story of normalizeStories(stories)) {
+      const item = await getItem(story.objectID);
+
+      if (item) {
+        loaded.push(item);
+      }
+    }
+
+    loaded.sort((a, b) => a.time - b.time);
+    return loaded;
   }
 
   // -------------------------
@@ -766,10 +799,19 @@ ${sanitizeHTML(comment.text) || ""}
     try {
       const ui = await createSidebar();
 
-      await loadDiscussion(
-        normalizeStories(stories),
-        ui
-      );
+      const loaded = await loadStories(stories);
+
+      if (loaded.length === 1) {
+        await renderSingleDiscussion(
+          loaded[0],
+          ui
+        );
+      } else {
+        await renderBlendedDiscussion(
+          loaded,
+          ui
+        );
+      }
 
     } catch (e) {
       console.error(e);
