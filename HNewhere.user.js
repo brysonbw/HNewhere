@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HNewhere
 // @namespace    https://github.com/twalichiewicz/HNewhere
-// @version      1.3
+// @version      1.4
 // @description  Hacker News comments sidebar for any article
 // @include      http://*
 // @include      https://*
@@ -9,6 +9,7 @@
 // @exclude https://localhost/*
 // @exclude      https://www.google.com/*
 // @exclude      https://www.google.*/*
+// @exclude      https://chatgpt.com/*
 // @exclude      https://*.google.com/*
 // @exclude      https://accounts.google.com/*
 // @exclude      https://mail.google.com/*
@@ -28,213 +29,218 @@
 // ==/UserScript==
 
 (function () {
-  "use strict";
+	"use strict";
 
-  const STORAGE = {
-    width: "hn_width",
+	const STORAGE = {
+		width: "hn_width",
 
-    last: "hn_last",
-  };
+		last: "hn_last",
+	};
 
-  let sidebar = null;
-  let opening = false;
+	let sidebar = null;
+	let opening = false;
 
-  // -------------------------
-  // Storage
-  // -------------------------
+	// -------------------------
+	// Storage
+	// -------------------------
 
-  async function save(key, value) {
-    await GM.setValue(key, value);
-  }
+	async function save(key, value) {
+		await GM.setValue(key, value);
+	}
 
-  async function load(key, fallback) {
-    try {
-      return await GM.getValue(key, fallback);
-    } catch {
-      return fallback;
-    }
-  }
+	async function load(key, fallback) {
+		try {
+			return await GM.getValue(key, fallback);
+		} catch {
+			return fallback;
+		}
+	}
 
-  // -------------------------
-  // Network
-  // -------------------------
+	// -------------------------
+	// Network
+	// -------------------------
 
-  function request(url) {
-    return new Promise((resolve, reject) => {
-      GM.xmlHttpRequest({
-        method: "GET",
+	function request(url) {
+		return new Promise((resolve, reject) => {
+			GM.xmlHttpRequest({
+				method: "GET",
 
-        url: url,
+				url: url,
 
-        onload: function (response) {
-          try {
-            resolve(JSON.parse(response.responseText));
-          } catch {
-            resolve(null);
-          }
-        },
+				onload: function (response) {
+					try {
+						resolve(JSON.parse(response.responseText));
+					} catch {
+						resolve(null);
+					}
+				},
 
-        onerror: reject,
-      });
-    });
-  }
+				onerror: function () {
+					resolve(null);
+				},
+			});
+		});
+	}
 
-  async function getItem(id) {
-    return request(
-      "https://hacker-news.firebaseio.com/v0/item/" + id + ".json",
-    );
-  }
+	async function getItem(id) {
+		return request(
+			"https://hacker-news.firebaseio.com/v0/item/" + id + ".json",
+		);
+	}
 
-  async function findHN(url) {
-    const target = normalizeURL(url);
+	async function findHN(url) {
+		const target = normalizeURL(url);
 
-    const queries = [url, target];
+		const queries = [url, target];
 
-    for (const query of queries) {
-      const result = await request(
-        "https://hn.algolia.com/api/v1/search?tags=story&restrictSearchableAttributes=url&query=" +
-          encodeURIComponent(query),
-      );
+		const matches = new Map();
 
-      if (!result || !result.hits) continue;
+		for (const query of queries) {
+			const result = await request(
+				"https://hn.algolia.com/api/v1/search?tags=story&restrictSearchableAttributes=url&hitsPerPage=100&query=" +
+					encodeURIComponent(query),
+			);
 
-      const exact = result.hits.find(
-        (item) => normalizeURL(item.url) === target,
-      );
+			if (!result || !result.hits) continue;
 
-      if (exact) {
-        return exact.objectID;
-      }
-    }
+			result.hits.forEach((item) => {
+				if (normalizeURL(item.url) === target) {
+					matches.set(item.objectID, item);
+				}
+			});
+		}
 
-    return null;
-  }
+		return [...matches.values()].sort(
+			(a, b) => b.created_at_i - a.created_at_i,
+		);
+	}
 
-  // -------------------------
-  // Helpers
-  // -------------------------
+	// -------------------------
+	// Helpers
+	// -------------------------
 
-  function normalizeURL(url) {
-    try {
-      const u = new URL(url);
+	function normalizeURL(url) {
+		try {
+			const u = new URL(url);
 
-      [
-        "utm_source",
-        "utm_medium",
-        "utm_campaign",
-        "utm_term",
-        "utm_content",
-        "fbclid",
-        "gclid",
-      ].forEach((param) => u.searchParams.delete(param));
+			[
+				"utm_source",
+				"utm_medium",
+				"utm_campaign",
+				"utm_term",
+				"utm_content",
+				"fbclid",
+				"gclid",
+			].forEach((param) => u.searchParams.delete(param));
 
-      return (
-        u.hostname +
-        u.pathname.replace(/\/$/, "") +
-        u.search
-      ).toLowerCase();
-    } catch {
-      return "";
-    }
-  }
+			return (
+				u.hostname +
+				u.pathname.replace(/\/$/, "") +
+				u.search
+			).toLowerCase();
+		} catch {
+			return "";
+		}
+	}
 
-  function sanitizeHTML(html) {
-    const template = document.createElement("template");
-    template.innerHTML = html || "";
+	function sanitizeHTML(html) {
+		const template = document.createElement("template");
+		template.innerHTML = html || "";
 
-    template.content
-      .querySelectorAll("script, iframe, object, embed")
-      .forEach((el) => el.remove());
+		template.content
+			.querySelectorAll("script, iframe, object, embed")
+			.forEach((el) => el.remove());
 
-    template.content.querySelectorAll("*").forEach((el) => {
-      for (const attr of [...el.attributes]) {
-        if (attr.name.startsWith("on")) {
-          el.removeAttribute(attr.name);
-        }
-      }
+		template.content.querySelectorAll("*").forEach((el) => {
+			for (const attr of [...el.attributes]) {
+				if (attr.name.startsWith("on")) {
+					el.removeAttribute(attr.name);
+				}
+			}
 
-      el.removeAttribute("style");
+			el.removeAttribute("style");
 
-      for (const attr of ["href", "src"]) {
-        const value = el.getAttribute(attr);
+			for (const attr of ["href", "src"]) {
+				const value = el.getAttribute(attr);
 
-        if (value && /^(javascript|data):/i.test(value)) {
-          el.removeAttribute(attr);
-        }
-      }
-    });
+				if (value && /^(javascript|data):/i.test(value)) {
+					el.removeAttribute(attr);
+				}
+			}
+		});
 
-    return template.innerHTML;
-  }
+		return template.innerHTML;
+	}
 
-  function escapeHTML(value) {
-    return String(value || "")
-      .replace(/&/g, "&amp;")
-      .replace(/</g, "&lt;")
-      .replace(/>/g, "&gt;")
-      .replace(/"/g, "&quot;");
-  }
+	function escapeHTML(value) {
+		return String(value || "")
+			.replace(/&/g, "&amp;")
+			.replace(/</g, "&lt;")
+			.replace(/>/g, "&gt;")
+			.replace(/"/g, "&quot;")
+			.replace(/'/g, "&#039;");
+	}
 
-  function timeAgo(timestamp) {
-    if (!timestamp) return "";
+	function timeAgo(timestamp) {
+		if (!timestamp) return "";
 
-    const seconds = Math.floor(Date.now() / 1000 - timestamp);
+		const seconds = Math.floor(Date.now() / 1000 - timestamp);
 
-    if (seconds < 60) return "just now";
+		if (seconds < 60) return "just now";
 
-    const minutes = Math.floor(seconds / 60);
+		const minutes = Math.floor(seconds / 60);
 
-    if (minutes < 60) return minutes + " minutes ago";
+		if (minutes < 60) return minutes + " minutes ago";
 
-    const hours = Math.floor(minutes / 60);
+		const hours = Math.floor(minutes / 60);
 
-    if (hours < 24) return hours + " hours ago";
+		if (hours < 24) return hours + " hours ago";
 
-    const days = Math.floor(hours / 24);
+		const days = Math.floor(hours / 24);
 
-    return days === 1 ? "1 day ago" : days + " days ago";
-  }
+		return days === 1 ? "1 day ago" : days + " days ago";
+	}
 
-  // -------------------------
-  // Popup helpers
-  // -------------------------
+	// -------------------------
+	// Popup helpers
+	// -------------------------
 
-  function openHNWindow(url) {
-    window.open(
-      url,
-      "hn_popup",
-      "width=760,height=700,resizable=yes,scrollbars=yes",
-    );
-  }
+	function openHNWindow(url) {
+		window.open(
+			url,
+			"hn_popup",
+			"width=760,height=700,resizable=yes,scrollbars=yes",
+		);
+	}
 
-  function replyURL(comment, storyID) {
-    return (
-      "https://news.ycombinator.com/reply?id=" +
-      comment.id +
-      "&goto=item%3Fid%3D" +
-      storyID +
-      "%23" +
-      comment.id
-    );
-  }
+	function replyURL(comment, storyID) {
+		return (
+			"https://news.ycombinator.com/reply?id=" +
+			comment.id +
+			"&goto=item%3Fid%3D" +
+			storyID +
+			"%23" +
+			comment.id
+		);
+	}
 
-  function commentURL(storyID) {
-    return "https://news.ycombinator.com/item?id=" + storyID;
-  }
+	function commentURL(storyID) {
+		return "https://news.ycombinator.com/item?id=" + storyID;
+	}
 
-  // -------------------------
-  // Restore button
-  // -------------------------
+	// -------------------------
+	// Restore button
+	// -------------------------
 
-  function createRestoreButton() {
-    let button = document.getElementById("hn-restore-button");
-    if (button) return button;
+	function createRestoreButton() {
+		let button = document.getElementById("hn-restore-button");
+		if (button) return button;
 
-    button = document.createElement("button");
-    button.id = "hn-restore-button";
-    button.textContent = "HN";
+		button = document.createElement("button");
+		button.id = "hn-restore-button";
+		button.textContent = "HN";
 
-    button.style.cssText = `
+		button.style.cssText = `
         position:fixed;
         top:12px;
         right:12px;
@@ -251,20 +257,20 @@
         box-shadow:0 1px 4px rgba(0,0,0,.25);
     `;
 
-    document.body.appendChild(button);
+		document.body.appendChild(button);
 
-    return button;
-  }
+		return button;
+	}
 
-  function createCollapsedButton(id) {
-    let button = document.getElementById("hn-collapse-button");
-    if (button) return button;
+	function createCollapsedButton(stories) {
+		let button = document.getElementById("hn-collapse-button");
+		if (button) return button;
 
-    button = document.createElement("button");
-    button.id = "hn-collapse-button";
-    button.textContent = "HN";
+		button = document.createElement("button");
+		button.id = "hn-collapse-button";
+		button.textContent = "HN";
 
-    button.style.cssText = `
+		button.style.cssText = `
 		position:fixed;
 		top:12px;
 		right:12px;
@@ -281,39 +287,39 @@
 		box-shadow:0 1px 4px rgba(0,0,0,.25);
 	`;
 
-    button.onclick = () => {
-      button.remove();
-      openSidebar(id).catch(console.error);
-    };
+		button.onclick = () => {
+			button.remove();
+			openSidebar(stories).catch(console.error);
+		};
 
-    document.body.appendChild(button);
+		document.body.appendChild(button);
 
-    return button;
-  }
+		return button;
+	}
 
-  // -------------------------
-  // Sidebar
-  // -------------------------
+	// -------------------------
+	// Sidebar
+	// -------------------------
 
-  async function createSidebar() {
-    if (sidebar) {
-      sidebar._cleanup?.();
-      sidebar.remove();
-      sidebar = null;
-    }
+	async function createSidebar() {
+		if (sidebar) {
+			sidebar._cleanup?.();
+			sidebar.remove();
+			sidebar = null;
+		}
 
-    const savedWidth = await load(STORAGE.width, 420);
+		const savedWidth = await load(STORAGE.width, 420);
 
-    const width = Math.min(Math.max(savedWidth, 280), window.innerWidth * 0.8);
+		const width = Math.min(Math.max(savedWidth, 280), window.innerWidth * 0.8);
 
-    const host = document.createElement("div");
-    document.body.appendChild(host);
+		const host = document.createElement("div");
+		document.body.appendChild(host);
 
-    const shadow = host.attachShadow({
-      mode: "open",
-    });
+		const shadow = host.attachShadow({
+			mode: "open",
+		});
 
-    shadow.innerHTML = `
+		shadow.innerHTML = `
 <style>
 
 #panel {
@@ -351,6 +357,15 @@ header button {
     color:black;
     cursor:pointer;
     font-size:16px;
+}
+
+.submission {
+    margin:16px 0;
+    padding-top:12px;
+}
+
+.submission + .submission {
+    border-top:1px solid #ccc;
 }
 
 #comments {
@@ -454,119 +469,121 @@ Loading...
 </div>
 `;
 
-    const panel = shadow.querySelector("#panel");
+		const panel = shadow.querySelector("#panel");
 
-    let resizing = false;
-    let startX = 0;
-    let startWidth = 0;
+		let resizing = false;
+		let startX = 0;
+		let startWidth = 0;
 
-    panel.addEventListener("mousemove", (e) => {
-      if (e.offsetX < 8) {
-        panel.style.cursor = "col-resize";
-      } else if (!resizing) {
-        panel.style.cursor = "default";
-      }
-    });
+		panel.addEventListener("mousemove", (e) => {
+			if (e.offsetX < 8) {
+				panel.style.cursor = "col-resize";
+			} else if (!resizing) {
+				panel.style.cursor = "default";
+			}
+		});
 
-    panel.addEventListener("mouseleave", () => {
-      if (!resizing) {
-        panel.style.cursor = "default";
-      }
-    });
+		panel.addEventListener("mouseleave", () => {
+			if (!resizing) {
+				panel.style.cursor = "default";
+			}
+		});
 
-    panel.addEventListener("mousedown", (e) => {
-      if (e.offsetX >= 8) return;
+		panel.addEventListener("mousedown", (e) => {
+			if (e.offsetX >= 8) return;
 
-      resizing = true;
-      startX = e.clientX;
-      startWidth = panel.offsetWidth;
+			resizing = true;
+			startX = e.clientX;
+			startWidth = panel.offsetWidth;
 
-      document.body.style.userSelect = "none";
-      document.body.style.cursor = "col-resize";
+			document.body.style.userSelect = "none";
+			document.body.style.cursor = "col-resize";
 
-      e.preventDefault();
-    });
+			e.preventDefault();
+		});
 
-    let resizeTimer;
+		let resizeTimer;
 
-    const onMouseMove = (e) => {
-      if (!resizing) return;
+		const onMouseMove = (e) => {
+			if (!resizing) return;
 
-      const delta = startX - e.clientX;
+			const delta = startX - e.clientX;
 
-      const newWidth = Math.min(
-        Math.max(startWidth + delta, 280),
-        window.innerWidth * 0.8,
-      );
+			const newWidth = Math.min(
+				Math.max(startWidth + delta, 280),
+				window.innerWidth * 0.8,
+			);
 
-      panel.style.width = newWidth + "px";
+			panel.style.width = newWidth + "px";
 
-      clearTimeout(resizeTimer);
+			clearTimeout(resizeTimer);
 
-      resizeTimer = setTimeout(() => {
-        if (!destroyed) {
-          save(STORAGE.width, newWidth);
-        }
-      }, 250);
-    };
+			resizeTimer = setTimeout(() => {
+				if (!destroyed) {
+					save(STORAGE.width, newWidth);
+				}
+			}, 250);
+		};
 
-    const onMouseUp = () => {
-      if (!resizing) return;
+		const onMouseUp = () => {
+			if (!resizing) return;
 
-      resizing = false;
+			resizing = false;
 
-      document.body.style.userSelect = "";
-      document.body.style.cursor = "";
+			document.body.style.userSelect = "";
+			document.body.style.cursor = "";
 
-      panel.style.cursor = "default";
-    };
+			panel.style.cursor = "default";
+		};
 
-    document.addEventListener("mousemove", onMouseMove);
-    document.addEventListener("mouseup", onMouseUp);
+		document.addEventListener("mousemove", onMouseMove);
+		document.addEventListener("mouseup", onMouseUp);
 
-    let destroyed = false;
+		let destroyed = false;
 
-    host._cleanup = () => {
-      destroyed = true;
-      clearTimeout(resizeTimer);
-      document.removeEventListener("mousemove", onMouseMove);
-      document.removeEventListener("mouseup", onMouseUp);
-    };
+		host._cleanup = () => {
+			destroyed = true;
+			clearTimeout(resizeTimer);
+			document.removeEventListener("mousemove", onMouseMove);
+			document.removeEventListener("mouseup", onMouseUp);
+		};
 
-    shadow.querySelector("#minimize").onclick = () => {
-      host.style.display = "none";
+		shadow.querySelector("#minimize").onclick = () => {
+			host.style.display = "none";
 
-      const restore = createRestoreButton();
+			const restore = createRestoreButton();
 
-      restore.onclick = () => {
-        host.style.display = "block";
-        restore.remove();
-      };
-    };
+			restore.onclick = () => {
+				host.style.display = "";
+				restore.remove();
+			};
+		};
 
-    document
-      .querySelectorAll("#hn-restore-button, #hn-collapse-button")
-      .forEach((button) => button.remove());
+		document
+			.querySelectorAll("#hn-restore-button, #hn-collapse-button")
+			.forEach((button) => button.remove());
 
-    sidebar = host;
+		sidebar = host;
 
-    return {
-      shadow,
-      body: shadow.querySelector("#comments"),
-    };
-  }
+		return {
+			shadow,
+			body: shadow.querySelector("#comments"),
+		};
+	}
 
-  // -------------------------
-  // Story rendering
-  // -------------------------
+	// -------------------------
+	// Story rendering
+	// -------------------------
 
-  function renderStory(story, container) {
-    const url = story.url || "https://news.ycombinator.com/item?id=" + story.id;
+	function renderStory(story, container, options = {}) {
+		const { multiple = false, stories = [] } = options;
 
-    container.innerHTML = `
+		const url = story.url || "https://news.ycombinator.com/item?id=" + story.id;
+
+		const wrapper = document.createElement("div");
+		wrapper.innerHTML = `
 
 <div class="story">
-
 
 <div class="story-title">
 
@@ -601,30 +618,32 @@ add comment
 <br>
 
 `;
+		const storyElement = wrapper.firstElementChild;
+		container.appendChild(storyElement);
 
-    container.querySelector(".add-comment").onclick = () => {
-      openHNWindow(commentURL(story.id));
-    };
-  }
+		storyElement.querySelector(".add-comment").onclick = () => {
+			openHNWindow(commentURL(story.id));
+		};
+	}
 
-  // -------------------------
-  // Comment rendering
-  // -------------------------
+	// -------------------------
+	// Comment rendering
+	// -------------------------
 
-  async function renderComment(id, container, storyID) {
-    const comment = await getItem(id);
+	async function renderComment(id, container, storyID) {
+		const comment = await getItem(id);
 
-    if (!comment || comment.deleted || comment.dead) return;
+		if (!comment || comment.deleted || comment.dead) return;
 
-    const div = document.createElement("div");
+		const div = document.createElement("div");
 
-    div.className = "comment";
+		div.className = "comment";
 
-    const replies = comment.kids || [];
+		const replies = comment.kids || [];
 
-    const reply = replyURL(comment, storyID);
+		const reply = replyURL(comment, storyID);
 
-    div.innerHTML = `
+		div.innerHTML = `
 
 <div class="meta">
 
@@ -659,174 +678,227 @@ ${sanitizeHTML(comment.text) || ""}
 
 `;
 
-    container.appendChild(div);
+		container.appendChild(div);
 
-    const children = div.querySelector(".children");
+		const children = div.querySelector(".children");
 
-    const toggle = div.querySelector(".toggle");
+		const toggle = div.querySelector(".toggle");
 
-    toggle.onclick = () => {
-      children.classList.toggle("hidden");
+		toggle.onclick = () => {
+			children.classList.toggle("hidden");
 
-      toggle.textContent = children.classList.contains("hidden")
-        ? "[+]"
-        : "[–]";
-    };
+			toggle.textContent = children.classList.contains("hidden")
+				? "[+]"
+				: "[–]";
+		};
 
-    const replyButton = div.querySelector(".reply-link");
+		const replyButton = div.querySelector(".reply-link");
 
-    replyButton.onclick = function (event) {
-      event.preventDefault();
+		replyButton.onclick = function (event) {
+			event.preventDefault();
 
-      openHNWindow(reply);
-    };
+			openHNWindow(reply);
+		};
 
-    for (let i = 0; i < replies.length; i++) {
-      await renderComment(replies[i], children, storyID);
+		for (let i = 0; i < replies.length; i++) {
+			await renderComment(replies[i], children, storyID);
 
-      if (i > 0 && i % 10 === 0) {
-        await new Promise(requestAnimationFrame);
-      }
-    }
-  }
+			if (i > 0 && i % 10 === 0) {
+				await new Promise(requestAnimationFrame);
+			}
+		}
+	}
 
-  // -------------------------
-  // Discussion loading
-  // -------------------------
+	// -------------------------
+	// Discussion loading
+	// -------------------------
 
-  async function loadDiscussion(id, ui) {
-    const story = await getItem(id);
+	async function renderSingleDiscussion(story, ui) {
+		ui.body.innerHTML = "";
 
-    if (!story) {
-      ui.body.textContent = "Unable to load HN discussion.";
-      return;
-    }
+		renderStory(story, ui.body);
 
-    renderStory(story, ui.body);
+		const comments = document.createElement("div");
+		comments.className = "top-level-comments";
+		ui.body.appendChild(comments);
 
-    const comments = document.createElement("div");
+		for (const child of story.kids || []) {
+			await renderComment(child, comments, story.id);
+		}
+	}
 
-    comments.className = "top-level-comments";
+	async function renderBlendedDiscussion(stories, ui) {
+		ui.body.innerHTML = "";
 
-    ui.body.appendChild(comments);
+		for (const story of stories) {
+			const section = document.createElement("div");
+			section.className = "submission";
 
-    const kids = story.kids || [];
+			ui.body.appendChild(section);
 
-    for (const child of kids) {
-      await renderComment(child, comments, story.id);
-    }
-  }
+			renderStory(story, section, {
+				multiple: true,
+				stories,
+			});
 
-  // -------------------------
-  // Open sidebar
-  // -------------------------
+			const comments = document.createElement("div");
+			comments.className = "top-level-comments";
 
-  async function openSidebar(id) {
-    if (opening) return;
+			section.appendChild(comments);
 
-    opening = true;
+			for (const child of story.kids || []) {
+				await renderComment(child, comments, story.id);
+			}
+		}
+	}
 
-    try {
-      const ui = await createSidebar();
-      await loadDiscussion(id, ui);
-    } catch (e) {
-      console.error(e);
-    } finally {
-      opening = false;
-    }
-  }
+	async function loadStories(stories) {
+		const loaded = [];
 
-  // -------------------------
-  // Hacker News click tracking
-  // -------------------------
+		for (const story of normalizeStories(stories)) {
+			const item = await getItem(story.objectID);
 
-  function setupHNListener() {
-    document.addEventListener(
-      "click",
-      async function (event) {
-        try {
-          const link = event.target.closest("a");
-          if (!link) return;
-          const row = link.closest("tr.athing");
-          if (!row) return;
-          if (!link.closest(".titleline")) return;
-          const id = row.id;
-          if (!id) return;
+			if (item) {
+				loaded.push(item);
+			}
+		}
 
-          console.log("Saving HN story:", id, link.href);
+		loaded.sort((a, b) => b.time - a.time);
+		return loaded;
+	}
 
-          save(STORAGE.last, {
-            url: link.href,
-            id: id,
-            timestamp: Date.now(),
-          }).catch(console.error);
-        } catch (e) {
-          console.error("Failed saving HN story:", e);
-        }
-      },
-      true,
-    );
-  }
+	// -------------------------
+	// Open sidebar
+	// -------------------------
+	function normalizeStories(stories) {
+		return stories.map((story) =>
+			typeof story === "string" ? { objectID: story } : story,
+		);
+	}
 
-  // -------------------------
-  // URL helpers
-  // -------------------------
+	async function openSidebar(stories) {
+		if (opening) return;
 
-  function sameURL(a, b) {
-    return normalizeURL(a) === normalizeURL(b);
-  }
+		opening = true;
 
-  // -------------------------
-  // Initialization
-  // -------------------------
+		try {
+			const ui = await createSidebar();
 
-  async function init() {
-    console.log("HNewhere sidebar loaded", location.href);
+			const loaded = await loadStories(stories);
 
-    // On HN, only record clicked stories.
-    if (location.hostname === "news.ycombinator.com") {
-      setupHNListener();
-      return;
-    }
+			if (!loaded.length) {
+				throw new Error("No HN stories could be loaded");
+			}
+			if (loaded.length === 1) {
+				await renderSingleDiscussion(loaded[0], ui);
+			} else {
+				await renderBlendedDiscussion(loaded, ui);
+			}
+		} catch (e) {
+			console.error(e);
+		} finally {
+			opening = false;
+		}
+	}
 
-    // Check if we arrived here by clicking
-    // a story from Hacker News.
-    let last = await load(STORAGE.last, null);
+	// -------------------------
+	// Hacker News click tracking
+	// -------------------------
 
-    if (last && Date.now() - last.timestamp > 60000) {
-      await save(STORAGE.last, null);
-      last = null;
-    }
+	function setupHNListener() {
+		document.addEventListener(
+			"click",
+			async function (event) {
+				try {
+					const link = event.target.closest("a");
+					if (!link) return;
+					const row = link.closest("tr.athing");
+					if (!row) return;
+					if (!link.closest(".titleline")) return;
+					const id = row.id;
+					if (!id) return;
 
-    console.log("Stored HN click:", last);
-    console.log("Current URL:", location.href);
-    console.log("Same URL:", last && sameURL(last.url, location.href));
-    console.log("Age:", last ? Date.now() - last.timestamp : null);
+					console.log("Saving HN story:", id, link.href);
 
-    if (
-      last &&
-      sameURL(last.url, location.href) &&
-      Date.now() - last.timestamp < 60000
-    ) {
-      console.log("Opening HN discussion from click:", last.id);
+					await save(STORAGE.last, {
+						url: link.href,
+						ids: [id],
+						timestamp: Date.now(),
+					});
+				} catch (e) {
+					console.error("Failed saving HN story:", e);
+				}
+			},
+			true,
+		);
+	}
 
-      await save(STORAGE.last, null);
+	// -------------------------
+	// URL helpers
+	// -------------------------
 
-      await openSidebar(last.id);
+	function sameURL(a, b) {
+		return normalizeURL(a) === normalizeURL(b);
+	}
 
-      return;
-    }
+	// -------------------------
+	// Initialization
+	// -------------------------
 
-    // Otherwise, silently check if this URL
-    // already has an HN discussion.
-    const id = await findHN(location.href);
+	async function init() {
+		console.log("HNewhere sidebar loaded", location.href);
 
-    if (id) {
-      console.log("Found HN discussion:", id);
+		// On HN, only record clicked stories.
+		if (location.hostname === "news.ycombinator.com") {
+			setupHNListener();
+			return;
+		}
 
-      createCollapsedButton(id);
-    }
-  }
+		// Check if we arrived here by clicking
+		// a story from Hacker News.
+		let last = await load(STORAGE.last, null);
 
-  init().catch(console.error);
+		if (last && Date.now() - last.timestamp > 300000) {
+			await save(STORAGE.last, null);
+			last = null;
+		}
+
+		console.log("Stored HN click:", last);
+		console.log("Current URL:", location.href);
+		console.log("Same URL:", last && sameURL(last.url, location.href));
+		console.log("Age:", last ? Date.now() - last.timestamp : null);
+
+		if (
+			last &&
+			sameURL(last.url, location.href) &&
+			Date.now() - last.timestamp < 300000
+		) {
+			console.log("Opening HN discussion from click:", last.ids);
+
+			await save(STORAGE.last, null);
+
+			await openSidebar(
+				last.ids.map((id) => ({
+					objectID: id,
+				})),
+			);
+
+			return;
+		}
+
+		// Otherwise, silently check if this URL
+		// already has an HN discussion.
+		const stories = await findHN(location.href);
+
+		if (stories.length) {
+			console.log(
+				"Found HN discussions:",
+				stories.map((s) => s.objectID),
+			);
+
+			createCollapsedButton(stories);
+		}
+	}
+
+	init().catch(console.error);
 })();
