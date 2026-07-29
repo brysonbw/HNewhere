@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HNewhere
 // @namespace    https://github.com/twalichiewicz/HNewhere
-// @version      1.3
+// @version      1.4
 // @description  Hacker News comments sidebar for any article
 // @include      http://*
 // @include      https://*
@@ -90,24 +90,26 @@
 
     const queries = [url, target];
 
+    const matches = new Map();
+
     for (const query of queries) {
       const result = await request(
-        "https://hn.algolia.com/api/v1/search?tags=story&restrictSearchableAttributes=url&query=" +
+        "https://hn.algolia.com/api/v1/search?tags=story&restrictSearchableAttributes=url&hitsPerPage=100&query=" +
           encodeURIComponent(query),
       );
 
       if (!result || !result.hits) continue;
 
-      const exact = result.hits.find(
-        (item) => normalizeURL(item.url) === target,
-      );
-
-      if (exact) {
-        return exact.objectID;
-      }
+      result.hits.forEach((item) => {
+        if (normalizeURL(item.url) === target) {
+          matches.set(item.objectID, item);
+        }
+      });
     }
 
-    return null;
+    return [...matches.values()].sort(
+      (a, b) => a.created_at_i - b.created_at_i,
+    );
   }
 
   // -------------------------
@@ -256,7 +258,7 @@
     return button;
   }
 
-  function createCollapsedButton(id) {
+  function createCollapsedButton(stories) {
     let button = document.getElementById("hn-collapse-button");
     if (button) return button;
 
@@ -283,7 +285,7 @@
 
     button.onclick = () => {
       button.remove();
-      openSidebar(id).catch(console.error);
+      openSidebar(stories).catch(console.error);
     };
 
     document.body.appendChild(button);
@@ -351,6 +353,18 @@ header button {
     color:black;
     cursor:pointer;
     font-size:16px;
+}
+
+.submission {
+    margin:16px 0;
+    padding-top:12px;
+    border-top:1px solid #ccc;
+}
+
+.submission-header {
+    font-size:11px;
+    color:#828282;
+    margin-bottom:8px;
 }
 
 #comments {
@@ -694,26 +708,40 @@ ${sanitizeHTML(comment.text) || ""}
   // Discussion loading
   // -------------------------
 
-  async function loadDiscussion(id, ui) {
-    const story = await getItem(id);
+  async function loadDiscussion(stories, ui) {
+    ui.body.innerHTML = "";
 
-    if (!story) {
-      ui.body.textContent = "Unable to load HN discussion.";
-      return;
-    }
+    for (const summary of stories) {
+      const story = await getItem(summary.objectID);
 
-    renderStory(story, ui.body);
+      if (!story) continue;
 
-    const comments = document.createElement("div");
+      const section = document.createElement("div");
 
-    comments.className = "top-level-comments";
+      section.className = "submission";
 
-    ui.body.appendChild(comments);
+      ui.body.appendChild(section);
 
-    const kids = story.kids || [];
+      const header = document.createElement("div");
 
-    for (const child of kids) {
-      await renderComment(child, comments, story.id);
+      header.className = "submission-header";
+
+      header.textContent =
+        "Submitted " + timeAgo(story.time);
+
+      section.appendChild(header);
+
+      renderStory(story, section);
+
+      const comments = document.createElement("div");
+
+      comments.className = "top-level-comments";
+
+      section.appendChild(comments);
+
+      for (const child of story.kids || []) {
+        await renderComment(child, comments, story.id);
+      }
     }
   }
 
@@ -721,7 +749,7 @@ ${sanitizeHTML(comment.text) || ""}
   // Open sidebar
   // -------------------------
 
-  async function openSidebar(id) {
+  async function openSidebar(stories) {
     if (opening) return;
 
     opening = true;
@@ -757,7 +785,7 @@ ${sanitizeHTML(comment.text) || ""}
 
           save(STORAGE.last, {
             url: link.href,
-            id: id,
+            ids: [id],
             timestamp: Date.now(),
           }).catch(console.error);
         } catch (e) {
@@ -812,19 +840,24 @@ ${sanitizeHTML(comment.text) || ""}
 
       await save(STORAGE.last, null);
 
-      await openSidebar(last.id);
+      await openSidebar(
+        last.ids || [last.id]
+      );
 
       return;
     }
 
     // Otherwise, silently check if this URL
     // already has an HN discussion.
-    const id = await findHN(location.href);
+    const stories = await findHN(location.href);
 
-    if (id) {
-      console.log("Found HN discussion:", id);
+    if (stories.length) {
+      console.log(
+        "Found HN discussions:",
+        stories.map((s) => s.objectID),
+      );
 
-      createCollapsedButton(id);
+      createCollapsedButton(stories);
     }
   }
 
