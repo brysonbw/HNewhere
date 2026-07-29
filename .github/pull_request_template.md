@@ -1,7 +1,7 @@
 <!-- 🌱 Thanks for contributing! Please fill out the heading/sections below to give context and explain your changes. -->
 <!-- 📝 Note: *Less is more*. *Please be concise* to help us review and merge your PR quickly. 🙂 -->
 
-## Change(s)
+## Changes
 
 <!-- ✏️ Describe *what* was changed in this PR. Be as clear and specific as possible. -->
 <!-- 📝 Note: Please try to use bullet points and/or numbered list.
@@ -17,7 +17,7 @@
 
 -->
 
-## What is the purpose of the change(s)?
+## What is the purpose of the changes?
 
 <!-- 🎯 Explain *why* these changes are needed. What problem do they solve? -->
 <!-- 📝 Note: Please try to use bullet points and/or numbered list. -->
