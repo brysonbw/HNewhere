@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         HNewhere
 // @namespace    https://github.com/twalichiewicz/HNewhere
-// @version      1.4.6
+// @version      1.4.7
 // @updateURL    https://raw.githubusercontent.com/twalichiewicz/HNewhere/main/HNewhere.user.js
 // @downloadURL  https://raw.githubusercontent.com/twalichiewicz/HNewhere/main/HNewhere.user.js
 // @homepageURL  https://github.com/twalichiewicz/HNewhere
@@ -13,7 +13,8 @@
 // @exclude https://localhost/*
 // @exclude      https://www.google.com/*
 // @exclude      https://www.google.*/*
-// @exclude      https://chatgpt.com/*
+// @exclude      https://chatgpt.com/
+// @exclude      https://claude.ai/
 // @exclude      https://*.google.com/*
 // @exclude      https://accounts.google.com/*
 // @exclude      https://mail.google.com/*
@@ -35,14 +36,45 @@
 (function () {
 	"use strict";
 
-	const STORAGE = {
+	const OLD_STORAGE = {
 		width: "hn_width",
 		position: "hn_button_position",
 		last: "hn_last",
+		collapsed: "hn_collapsed_comments",
+		seen: "hn_seen_comments",
+	};
+
+	async function migrateStorage() {
+		const migrated = await load("HNewhere:migrated", false);
+
+		if (migrated) return;
+
+		try {
+			for (const key of Object.keys(STORAGE)) {
+				const oldValue = await load(OLD_STORAGE[key], null);
+
+				if (oldValue !== null) {
+					await save(STORAGE[key], oldValue);
+				}
+			}
+
+			await save("HNewhere:migrated", 1);
+		} catch (e) {
+			console.error("HNewhere migration failed:", e);
+		}
+	}
+
+	const STORAGE = {
+		width: "HNewhere:width",
+		position: "HNewhere:button_position",
+		last: "HNewhere:last",
+		collapsed: "HNewhere:collapsed_comments",
+		seen: "HNewhere:seen_comments",
 	};
 
 	let sidebar = null;
 	let opening = false;
+	let sidebarGeneration = 0;
 
 	// -------------------------
 	// Storage
@@ -60,16 +92,52 @@
 		}
 	}
 
+	async function loadCollapsed() {
+		const ids = await load(STORAGE.collapsed, []);
+		return new Set(Array.isArray(ids) ? ids : []);
+	}
+
+	async function saveCollapsed(ids) {
+		await save(STORAGE.collapsed, ids);
+	}
+
+	async function getSeenTime(storyID) {
+		const seen = await load(STORAGE.seen, {});
+		return seen[storyID] || 0;
+	}
+
+	async function markSeen(storyID) {
+		const seen = await load(STORAGE.seen, {});
+
+		seen[storyID] = Math.floor(Date.now() / 1000);
+
+		await save(STORAGE.seen, seen);
+	}
+
+	async function toggleCollapsed(id, collapsed) {
+		const ids = new Set(await loadCollapsed());
+
+		if (collapsed) {
+			ids.add(id);
+		} else {
+			ids.delete(id);
+		}
+
+		await saveCollapsed([...ids]);
+	}
+
 	// -------------------------
 	// Network
 	// -------------------------
 
 	function request(url) {
-		return new Promise((resolve, reject) => {
+		return new Promise((resolve) => {
 			GM.xmlHttpRequest({
 				method: "GET",
 
 				url: url,
+
+				timeout: 10000,
 
 				onload: function (response) {
 					try {
@@ -82,18 +150,44 @@
 				onerror: function () {
 					resolve(null);
 				},
+
+				ontimeout: function () {
+					resolve(null);
+				},
 			});
 		});
 	}
 
+	const itemCache = new Map();
+
 	async function getItem(id) {
-		return request(
+		if (itemCache.has(id)) {
+			return itemCache.get(id);
+		}
+
+		const item = await request(
 			"https://hacker-news.firebaseio.com/v0/item/" + id + ".json",
 		);
+
+		itemCache.set(id, item);
+
+		return item;
 	}
 
 	async function findHN(url) {
 		const target = normalizeURL(url);
+
+		if (!target) {
+			return [];
+		}
+
+		const cacheKey = "HNewhere:hn_cache:" + target;
+
+		const cached = await load(cacheKey, null);
+
+		if (cached && Date.now() - cached.timestamp < 3600000) {
+			return cached.results;
+		}
 
 		const queries = [url, target];
 
@@ -101,22 +195,31 @@
 
 		for (const query of queries) {
 			const result = await request(
-				"https://hn.algolia.com/api/v1/search?tags=story&restrictSearchableAttributes=url&hitsPerPage=100&query=" +
+				"https://hn.algolia.com/api/v1/search?tags=story&restrictSearchableAttributes=url&hitsPerPage=20&query=" +
 					encodeURIComponent(query),
 			);
 
-			if (!result || !result.hits) continue;
+			if (!result || !result.hits) {
+				continue;
+			}
 
-			result.hits.forEach((item) => {
+			for (const item of result.hits) {
 				if (normalizeURL(item.url) === target) {
 					matches.set(item.objectID, item);
 				}
-			});
+			}
 		}
 
-		return [...matches.values()].sort(
+		const sorted = [...matches.values()].sort(
 			(a, b) => b.created_at_i - a.created_at_i,
 		);
+
+		await save(cacheKey, {
+			timestamp: Date.now(),
+			results: sorted,
+		});
+
+		return sorted;
 	}
 
 	// -------------------------
@@ -151,27 +254,77 @@
 		const template = document.createElement("template");
 		template.innerHTML = html || "";
 
-		template.content
-			.querySelectorAll("script, iframe, object, embed")
-			.forEach((el) => el.remove());
+		const allowedTags = new Set([
+			"A",
+			"P",
+			"PRE",
+			"CODE",
+			"B",
+			"STRONG",
+			"I",
+			"EM",
+			"BLOCKQUOTE",
+			"BR",
+			"TT",
+			"UL",
+			"OL",
+			"LI",
+			"HR",
+		]);
 
-		template.content.querySelectorAll("*").forEach((el) => {
-			for (const attr of [...el.attributes]) {
-				if (attr.name.startsWith("on")) {
-					el.removeAttribute(attr.name);
+		function cleanNode(node) {
+			for (const child of [...node.childNodes]) {
+				if (child.nodeType !== Node.ELEMENT_NODE) {
+					continue;
 				}
-			}
 
-			el.removeAttribute("style");
+				if (!allowedTags.has(child.tagName)) {
+					const fragment = document.createDocumentFragment();
 
-			for (const attr of ["href", "src"]) {
-				const value = el.getAttribute(attr);
+					while (child.firstChild) {
+						fragment.appendChild(child.firstChild);
+					}
 
-				if (value && /^(javascript|data):/i.test(value)) {
-					el.removeAttribute(attr);
+					child.replaceWith(fragment);
+					continue;
 				}
+
+				const originalText = child.textContent;
+
+				let safeHref = null;
+
+				if (child.tagName === "A") {
+					const href = child.getAttribute("href");
+
+					try {
+						const url = new URL(href, location.origin);
+
+						if (url.protocol !== "http:" && url.protocol !== "https:") {
+							throw new Error();
+						}
+
+						safeHref = url.href;
+					} catch {
+						child.replaceWith(document.createTextNode(originalText));
+						continue;
+					}
+				}
+
+				for (const attr of [...child.attributes]) {
+					child.removeAttribute(attr.name);
+				}
+
+				if (safeHref) {
+					child.setAttribute("href", safeHref);
+					child.setAttribute("target", "_blank");
+					child.setAttribute("rel", "noopener noreferrer");
+				}
+
+				cleanNode(child);
 			}
-		});
+		}
+
+		cleanNode(template.content);
 
 		return template.innerHTML;
 	}
@@ -205,23 +358,12 @@
 		return days === 1 ? "1 day ago" : days + " days ago";
 	}
 
-	function isMobile() {
-		return window.matchMedia("(max-width: 700px)").matches;
+	function isNewComment(comment, seenTimestamp) {
+		return comment.time && comment.time > seenTimestamp;
 	}
 
-	function clampButtonPosition(button) {
-		const maxX = window.innerWidth - button.offsetWidth;
-		const maxY = window.innerHeight - button.offsetHeight;
-
-		const currentX = parseInt(button.style.left || button.offsetLeft, 10);
-		const currentY = parseInt(button.style.top || button.offsetTop, 10);
-
-		const x = Math.max(0, Math.min(currentX, maxX));
-		const y = Math.max(0, Math.min(currentY, maxY));
-
-		button.style.left = x + "px";
-		button.style.top = y + "px";
-		button.style.right = "auto";
+	function isMobile() {
+		return window.matchMedia("(max-width: 700px)").matches;
 	}
 
 	// -------------------------
@@ -366,6 +508,7 @@
 
 	async function createRestoreButton() {
 		let button = document.getElementById("hn-restore-button");
+
 		if (button) return button;
 
 		button = document.createElement("button");
@@ -373,27 +516,55 @@
 		button.textContent = "HN";
 
 		button.style.cssText = `
-        position:fixed;
-        top:12px;
-        right:12px;
-        z-index:2147483647;
-        background:#ff6600;
-        color:white;
-        border:none;
-        border-radius:3px;
-        padding:4px 8px;
-        font-family:Verdana,sans-serif;
-        font-size:11px;
-        font-weight:bold;
-        cursor:pointer;
-        box-shadow:0 1px 4px rgba(0,0,0,.25);
-        -webkit-tap-highlight-color: transparent;
-    `;
+			position:fixed;
+			top:12px;
+			right:12px;
+			z-index:2147483647;
+			background:#ff6600;
+			color:white;
+			border:none;
+			border-radius:3px;
+			padding:4px 8px;
+			font-family:Verdana,sans-serif;
+			font-size:11px;
+			font-weight:bold;
+			cursor:pointer;
+			box-shadow:0 1px 4px rgba(0,0,0,.25);
+			user-select:none;
+			touch-action:none;
+			-webkit-tap-highlight-color:transparent;
+		`;
+
+		if (isMobile()) {
+			Object.assign(button.style, {
+				width: "44px",
+				height: "44px",
+				padding: "0",
+				borderRadius: "50%",
+				display: "flex",
+				alignItems: "center",
+				justifyContent: "center",
+				fontSize: "13px",
+				top: "16px",
+				right: "16px",
+			});
+		}
 
 		document.body.appendChild(button);
 
 		await applyButtonPosition(button);
-		makeButtonDraggable(button);
+
+		const wasMoved = makeButtonDraggable(button);
+
+		button.onclick = () => {
+			if (wasMoved()) return;
+
+			if (sidebar) {
+				sidebar.style.display = "";
+			}
+
+			button.remove();
+		};
 
 		return button;
 	}
@@ -425,6 +596,19 @@
 			touch-action:none;
 			-webkit-tap-highlight-color: transparent;
 		`;
+
+		if (isMobile()) {
+			button.style.width = "44px";
+			button.style.height = "44px";
+			button.style.padding = "0";
+			button.style.borderRadius = "50%";
+			button.style.display = "flex";
+			button.style.alignItems = "center";
+			button.style.justifyContent = "center";
+			button.style.fontSize = "13px";
+			button.style.top = "16px";
+			button.style.right = "16px";
+		}
 
 		document.body.appendChild(button);
 
@@ -514,20 +698,33 @@ header button {
 }
 
 #comments {
+	flex:1 1 auto;
+	min-height:0;
     overflow:auto;
     overflow-x:hidden;
+	overscroll-behavior:contain;
     padding:8px 12px;
     word-wrap:break-word;
 }
 
 .comment {
-    margin:12px 0 12px 15px;
+    margin:12px 0 12px 18px;
     max-width:100%;
     overflow-wrap:anywhere;
 }
 
 .top-level-comments > .comment {
     margin-left:0;
+}
+
+.children > .comment {
+    border-left:1px solid #ddd;
+    padding-left:8px;
+}
+
+.comment.new-comment {
+	border-left:2px solid #ff6600;
+	padding-left:6px;
 }
 
 .text {
@@ -558,6 +755,19 @@ header button {
     text-decoration:underline;
 }
 
+.op-pill {
+    display:inline-block;
+    margin-left:4px;
+    margin-right:4px;
+    padding:1px 4px;
+    border-radius:3px;
+    background:#ff6600;
+    color:white;
+    font-size:9px;
+    font-weight:bold;
+    line-height:1.2;
+}
+
 .toggle {
     cursor:pointer;
 }
@@ -579,6 +789,23 @@ header button {
     color:#828282;
     font-size:10px;
     line-height:1.4;
+}
+
+.story-text {
+    margin:10px 0;
+    line-height:1.45;
+}
+
+.story-text p:first-child {
+    margin-top:0;
+}
+
+.story-text p:last-child {
+    margin-bottom:0;
+}
+
+.story-text a {
+    color:#0000aa;
 }
 
 .story-actions {
@@ -615,6 +842,12 @@ Loading...
 `;
 
 		const panel = shadow.querySelector("#panel");
+
+		// Stop scroll/touch events moving out of sidebar so sites with
+		// JS scroll hijacking (wheel listeners on window) don't scroll behind
+		for (const type of ["wheel", "touchmove"]) {
+			host.addEventListener(type, (event) => event.stopPropagation());
+		}
 
 		let resizing = false;
 		let startX = 0;
@@ -686,11 +919,23 @@ Loading...
 
 		let destroyed = false;
 
+		const clampSidebarWidth = () => {
+			const maxWidth = window.innerWidth * 0.8;
+
+			if (panel.offsetWidth > maxWidth) {
+				panel.style.width = maxWidth + "px";
+				save(STORAGE.width, maxWidth);
+			}
+		};
+
+		window.addEventListener("resize", clampSidebarWidth);
+
 		host._cleanup = () => {
 			destroyed = true;
 			clearTimeout(resizeTimer);
 			document.removeEventListener("mousemove", onMouseMove);
 			document.removeEventListener("mouseup", onMouseUp);
+			window.removeEventListener("resize", clampSidebarWidth);
 		};
 
 		shadow.querySelector("#minimize").onclick = async () => {
@@ -721,9 +966,11 @@ Loading...
 	// -------------------------
 
 	function renderStory(story, container, options = {}) {
-		const { multiple = false, stories = [] } = options;
+		if (!story?.id) {
+			return;
+		}
 
-		const url = story.url || "https://news.ycombinator.com/item?id=" + story.id;
+		const hnURL = commentURL(story.id);
 
 		const wrapper = document.createElement("div");
 		wrapper.innerHTML = `
@@ -733,7 +980,8 @@ Loading...
 <div class="story-title">
 
 <a target="_blank"
-href="${escapeHTML(url)}">
+href="${escapeHTML(hnURL)}"
+title="Open discussion on Hacker News">
 
 ${escapeHTML(story.title)}
 
@@ -749,7 +997,22 @@ ${escapeHTML(story.by || "")}
 |
 
 ${timeAgo(story.time)}
+
+|
+
+${story.descendants || 0} comments
+
 </div>
+
+${
+	story.text
+		? `
+<div class="story-text">
+${sanitizeHTML(story.text)}
+</div>
+`
+		: ""
+}
 
 <div class="story-actions">
 
@@ -775,66 +1038,120 @@ add comment
 	// Comment rendering
 	// -------------------------
 
-	async function renderComment(id, container, storyID) {
+	async function renderChildren(
+		replyIDs,
+		container,
+		storyID,
+		storyAuthor,
+		seenTime,
+		collapsedIds,
+		generation = sidebarGeneration,
+	) {
+		const batchSize = 5;
+
+		for (let i = 0; i < replyIDs.length; i += batchSize) {
+			const batch = replyIDs.slice(i, i + batchSize);
+
+			await Promise.all(
+				batch.map((id) =>
+					renderComment(
+						id,
+						container,
+						storyID,
+						storyAuthor,
+						seenTime,
+						collapsedIds,
+						generation,
+					),
+				),
+			);
+
+			await new Promise(requestAnimationFrame);
+		}
+	}
+
+	async function renderComment(
+		id,
+		container,
+		storyID,
+		storyAuthor,
+		seenTime = 0,
+		collapsedIds = new Set(),
+		generation = sidebarGeneration,
+	) {
 		const comment = await getItem(id);
 
-		if (!comment || comment.deleted || comment.dead) return;
+		if (generation !== sidebarGeneration) {
+			return;
+		}
 
+		if (!comment || comment.deleted || comment.dead) return;
 		const div = document.createElement("div");
 
 		div.className = "comment";
 
-		const replies = comment.kids || [];
+		if (isNewComment(comment, seenTime)) {
+			div.classList.add("new-comment");
+		}
 
+		const replies = comment.kids || [];
 		const reply = replyURL(comment, storyID);
 
 		div.innerHTML = `
+      <div class="meta">
 
-<div class="meta">
+      <a target="_blank"
+      href="https://news.ycombinator.com/user?id=${encodeURIComponent(comment.by || "")}">
 
+      ${escapeHTML(comment.by || "anonymous")}
 
-<a target="_blank"
-href="https://news.ycombinator.com/user?id=${encodeURIComponent(comment.by || "")}">
+      </a>
 
-${escapeHTML(comment.by || "anonymous")}
+      ${
+				comment.by && comment.by === storyAuthor
+					? `<span class="op-pill">OP</span>`
+					: ""
+			}
 
-</a>
+      ${timeAgo(comment.time)}
 
+      |
 
-${timeAgo(comment.time)}
+      <a class="reply-link" href="#">
+      reply
+      </a>
 
-|
+      <span class="toggle">
+      [–]
+      </span>
 
-<a class="reply-link"
-href="#">
-reply
-</a>
+      </div>
 
-<span class="toggle">
-[–]
-</span>
-</div>
-
-<div class="text">
-<div class="children">
-${sanitizeHTML(comment.text) || ""}
-</div>
-</div>
-
-`;
+      <div class="comment-content">
+       	<div class="text">
+        		${sanitizeHTML(comment.text) || ""}
+       	</div>
+       	<div class="children"></div>
+      </div>
+    `;
 
 		container.appendChild(div);
 
+		const content = div.querySelector(".comment-content");
 		const children = div.querySelector(".children");
-
 		const toggle = div.querySelector(".toggle");
 
-		toggle.onclick = () => {
-			children.classList.toggle("hidden");
+		if (collapsedIds.has(comment.id)) {
+			content.classList.add("hidden");
+			toggle.textContent = "[+]";
+		}
 
-			toggle.textContent = children.classList.contains("hidden")
-				? "[+]"
-				: "[–]";
+		toggle.onclick = async () => {
+			const hidden = content.classList.toggle("hidden");
+
+			toggle.textContent = hidden ? "[+]" : "[–]";
+
+			await toggleCollapsed(comment.id, hidden);
 		};
 
 		const replyButton = div.querySelector(".reply-link");
@@ -845,12 +1162,16 @@ ${sanitizeHTML(comment.text) || ""}
 			openHNWindow(reply);
 		};
 
-		for (let i = 0; i < replies.length; i++) {
-			await renderComment(replies[i], children, storyID);
-
-			if (i > 0 && i % 10 === 0) {
-				await new Promise(requestAnimationFrame);
-			}
+		if (replies.length) {
+			await renderChildren(
+				replies,
+				children,
+				storyID,
+				storyAuthor,
+				seenTime,
+				collapsedIds,
+				generation,
+			);
 		}
 	}
 
@@ -867,9 +1188,19 @@ ${sanitizeHTML(comment.text) || ""}
 		comments.className = "top-level-comments";
 		ui.body.appendChild(comments);
 
-		for (const child of story.kids || []) {
-			await renderComment(child, comments, story.id);
-		}
+		const seenTime = await getSeenTime(story.id);
+		const collapsedIds = await loadCollapsed();
+
+		await renderChildren(
+			story.kids || [],
+			comments,
+			story.id,
+			story.by,
+			seenTime,
+			collapsedIds,
+		);
+
+		await markSeen(story.id);
 	}
 
 	async function renderBlendedDiscussion(stories, ui) {
@@ -891,25 +1222,36 @@ ${sanitizeHTML(comment.text) || ""}
 
 			section.appendChild(comments);
 
-			for (const child of story.kids || []) {
-				await renderComment(child, comments, story.id);
-			}
+			const seenTime = await getSeenTime(story.id);
+			const collapsedIds = await loadCollapsed();
+
+			await renderChildren(
+				story.kids || [],
+				comments,
+				story.id,
+				story.by,
+				seenTime,
+				collapsedIds,
+			);
+
+			await markSeen(story.id);
 		}
 	}
 
 	async function loadStories(stories) {
-		const loaded = [];
+		const ids = [
+			...new Set(
+				normalizeStories(stories)
+					.map((story) => story.objectID)
+					.filter(Boolean),
+			),
+		];
 
-		for (const story of normalizeStories(stories)) {
-			const item = await getItem(story.objectID);
+		const items = await Promise.all(ids.map((id) => getItem(id)));
 
-			if (item) {
-				loaded.push(item);
-			}
-		}
-
-		loaded.sort((a, b) => b.time - a.time);
-		return loaded;
+		return items
+			.filter((item) => item && item.type === "story")
+			.sort((a, b) => b.time - a.time);
 	}
 
 	// -------------------------
@@ -927,13 +1269,19 @@ ${sanitizeHTML(comment.text) || ""}
 		opening = true;
 
 		try {
-			const ui = await createSidebar();
-
 			const loaded = await loadStories(stories);
 
 			if (!loaded.length) {
 				throw new Error("No HN stories could be loaded");
 			}
+
+			const generation = ++sidebarGeneration;
+			const ui = await createSidebar();
+
+			if (generation !== sidebarGeneration) {
+				return;
+			}
+
 			if (loaded.length === 1) {
 				await renderSingleDiscussion(loaded[0], ui);
 			} else {
@@ -955,19 +1303,17 @@ ${sanitizeHTML(comment.text) || ""}
 			"click",
 			async function (event) {
 				try {
-					const link = event.target.closest("a");
-					if (!link) return;
-					const row = link.closest("tr.athing");
-					if (!row) return;
-					if (!link.closest(".titleline")) return;
-					const id = row.id;
-					if (!id) return;
+					const link = event.target.closest(".titleline > a");
 
-					console.log("Saving HN story:", id, link.href);
+					if (!link) return;
+
+					const row = link.closest("tr.athing");
+
+					if (!row?.id) return;
 
 					await save(STORAGE.last, {
 						url: link.href,
-						ids: [id],
+						ids: [row.id],
 						timestamp: Date.now(),
 					});
 				} catch (e) {
@@ -991,7 +1337,7 @@ ${sanitizeHTML(comment.text) || ""}
 	// -------------------------
 
 	async function init() {
-		console.log("HNewhere sidebar loaded", location.href);
+		await migrateStorage();
 
 		// On HN, only record clicked stories.
 		if (location.hostname === "news.ycombinator.com") {
@@ -1008,18 +1354,11 @@ ${sanitizeHTML(comment.text) || ""}
 			last = null;
 		}
 
-		console.log("Stored HN click:", last);
-		console.log("Current URL:", location.href);
-		console.log("Same URL:", last && sameURL(last.url, location.href));
-		console.log("Age:", last ? Date.now() - last.timestamp : null);
-
 		if (
 			last &&
 			sameURL(last.url, location.href) &&
 			Date.now() - last.timestamp < 300000
 		) {
-			console.log("Opening HN discussion from click:", last.ids);
-
 			await save(STORAGE.last, null);
 
 			await openSidebar(
@@ -1036,11 +1375,6 @@ ${sanitizeHTML(comment.text) || ""}
 		const stories = await findHN(location.href);
 
 		if (stories.length) {
-			console.log(
-				"Found HN discussions:",
-				stories.map((s) => s.objectID),
-			);
-
 			if (isMobile()) {
 				await createCollapsedButton(stories);
 			} else {
