@@ -358,6 +358,9 @@ header button {
 .submission {
     margin:16px 0;
     padding-top:12px;
+}
+
+.submission + .submission {
     border-top:1px solid #ccc;
 }
 
@@ -577,7 +580,7 @@ Loading...
   function renderStory(story, container) {
     const url = story.url || "https://news.ycombinator.com/item?id=" + story.id;
 
-    container.innerHTML = `
+    container.insertAdjacentHTML("beforeend", `
 
 <div class="story">
 
@@ -614,7 +617,7 @@ add comment
 
 <br>
 
-`;
+`);
 
     container.querySelector(".add-comment").onclick = () => {
       openHNWindow(commentURL(story.id));
@@ -747,6 +750,13 @@ ${sanitizeHTML(comment.text) || ""}
   // -------------------------
   // Open sidebar
   // -------------------------
+  function normalizeStories(stories) {
+    return stories.map(story =>
+      typeof story === "string"
+        ? { objectID: story }
+        : story
+    );
+  }
 
   async function openSidebar(stories) {
     if (opening) return;
@@ -755,7 +765,12 @@ ${sanitizeHTML(comment.text) || ""}
 
     try {
       const ui = await createSidebar();
-      await loadDiscussion(id, ui);
+
+      await loadDiscussion(
+        normalizeStories(stories),
+        ui
+      );
+
     } catch (e) {
       console.error(e);
     } finally {
@@ -835,11 +850,15 @@ ${sanitizeHTML(comment.text) || ""}
       sameURL(last.url, location.href) &&
       Date.now() - last.timestamp < 60000
     ) {
-      console.log("Opening HN discussion from click:", last.id);
+      console.log("Opening HN discussion from click:", last.ids);
 
       await save(STORAGE.last, null);
 
-      await openSidebar(last.ids || [last.id]);
+      await openSidebar(
+        last.ids.map(id => ({
+          objectID: id
+        }))
+      );
 
       return;
     }
