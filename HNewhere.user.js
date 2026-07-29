@@ -726,8 +726,7 @@ ${sanitizeHTML(comment.text) || ""}
 
       header.className = "submission-header";
 
-      header.textContent =
-        "Submitted " + timeAgo(story.time);
+      header.textContent = "Submitted " + timeAgo(story.time);
 
       section.appendChild(header);
 
@@ -840,9 +839,7 @@ ${sanitizeHTML(comment.text) || ""}
 
       await save(STORAGE.last, null);
 
-      await openSidebar(
-        last.ids || [last.id]
-      );
+      await openSidebar(last.ids || [last.id]);
 
       return;
     }
