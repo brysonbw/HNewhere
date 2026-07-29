@@ -111,7 +111,7 @@
 		}
 
 		return [...matches.values()].sort(
-			(a, b) => a.created_at_i - b.created_at_i,
+			(a, b) => b.created_at_i - a.created_at_i,
 		);
 	}
 
@@ -366,12 +366,6 @@ header button {
 
 .submission + .submission {
     border-top:1px solid #ccc;
-}
-
-.submission-header {
-    font-size:11px;
-    color:#828282;
-    margin-bottom:8px;
 }
 
 #comments {
@@ -742,12 +736,6 @@ ${sanitizeHTML(comment.text) || ""}
 
 			ui.body.appendChild(section);
 
-			const header = document.createElement("div");
-			header.className = "submission-header";
-			header.textContent = `${story.title} (${story.score || 0} points)`;
-
-			section.appendChild(header);
-
 			renderStory(story, section, {
 				multiple: true,
 				stories,
@@ -775,7 +763,7 @@ ${sanitizeHTML(comment.text) || ""}
 			}
 		}
 
-		loaded.sort((a, b) => a.time - b.time);
+		loaded.sort((a, b) => b.time - a.time);
 		return loaded;
 	}
 
