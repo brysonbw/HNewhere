@@ -796,6 +796,7 @@ ${sanitizeHTML(comment.text) || ""}
 			const ui = await createSidebar();
 
 			const loaded = await loadStories(stories);
+
 			if (!loaded.length) {
 				throw new Error("No HN stories could be loaded");
 			}
@@ -830,7 +831,7 @@ ${sanitizeHTML(comment.text) || ""}
 
 					console.log("Saving HN story:", id, link.href);
 
-					save(STORAGE.last, {
+					await save(STORAGE.last, {
 						url: link.href,
 						ids: [id],
 						timestamp: Date.now(),
@@ -881,7 +882,7 @@ ${sanitizeHTML(comment.text) || ""}
 		if (
 			last &&
 			sameURL(last.url, location.href) &&
-			Date.now() - last.timestamp < 60000
+			Date.now() - last.timestamp < 300000
 		) {
 			console.log("Opening HN discussion from click:", last.ids);
 
