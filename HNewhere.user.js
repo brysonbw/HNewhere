@@ -1,7 +1,11 @@
 // ==UserScript==
 // @name         HNewhere
 // @namespace    https://github.com/twalichiewicz/HNewhere
-// @version      1.4.5
+// @version      1.4.6
+// @updateURL    https://raw.githubusercontent.com/twalichiewicz/HNewhere/main/HNewhere.user.js
+// @downloadURL  https://raw.githubusercontent.com/twalichiewicz/HNewhere/main/HNewhere.user.js
+// @homepageURL  https://github.com/twalichiewicz/HNewhere
+// @supportURL   https://github.com/twalichiewicz/HNewhere/issues
 // @description  Hacker News comments sidebar for any article
 // @include      http://*
 // @include      https://*
