@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         HNewhere
 // @namespace    https://github.com/twalichiewicz/HNewhere
-// @version      1.5.0
-// @license MIT
+// @version      1.5.1
+// @license      MIT
 // @updateURL    https://raw.githubusercontent.com/twalichiewicz/HNewhere/main/HNewhere.user.js
 // @downloadURL  https://raw.githubusercontent.com/twalichiewicz/HNewhere/main/HNewhere.user.js
 // @homepageURL  https://github.com/twalichiewicz/HNewhere
@@ -10,8 +10,8 @@
 // @description  Hacker News comments sidebar for any article
 // @include      http://*
 // @include      https://*
-// @exclude http://localhost/*
-// @exclude https://localhost/*
+// @exclude      http://localhost/*
+// @exclude      https://localhost/*
 // @exclude      https://www.google.com/*
 // @exclude      https://www.google.*/*
 // @exclude      https://chatgpt.com/
@@ -31,6 +31,7 @@
 // @grant        GM.xmlHttpRequest
 // @connect      hacker-news.firebaseio.com
 // @connect      hn.algolia.com
+// @connect      news.ycombinator.com
 // @run-at       document-end
 // @noframes
 // ==/UserScript==
@@ -82,7 +83,15 @@
 		seen: "HNewhere:seen_comments",
 		settings: "HNewhere:settings",
 		state: "HNewhere:sidebar_state",
+		votes: "HNewhere:votes",
 	};
+
+	// Votes have to be remembered locally. The sidebar reads HN over a cross-site
+	// GM request, which the browser strips the SameSite session cookie from, so a
+	// fetched page always reports "not voted" no matter what you have voted on.
+	// Only the popup sees the real state, so what it reports is recorded here and
+	// replayed over anonymously fetched pages.
+	const VOTE_MEMORY_TTL = 90 * 24 * 60 * 60 * 1000;
 
 	const DEFAULT_SETTINGS = {
 		annotations: false,
@@ -90,6 +99,23 @@
 		annotationsWhenSidebarClosed: false,
 		autoOpenSidebar: false,
 	};
+
+	const HN_ORIGIN = "https://news.ycombinator.com";
+	const VOTE_BRIDGE_MESSAGE_SOURCE = "HNewhereVoteBridge";
+
+	// The popup votes by navigating to the vote URL, and HN's goto redirect drops
+	// the URL fragment, so the bridge payload cannot ride the hash across it.
+	// sessionStorage is per-tab and per-origin, which is exactly the popup's life.
+	const VOTE_BRIDGE_STORAGE_KEY = "hnewhere-vote-bridge";
+	const TRACKING_PARAMS = new Set([
+		"utm_source",
+		"utm_medium",
+		"utm_campaign",
+		"utm_term",
+		"utm_content",
+		"fbclid",
+		"gclid",
+	]);
 
 	let sidebar = null;
 	let sidebarUI = null;
@@ -191,7 +217,18 @@
 			return perSiteWidth;
 		}
 
-		return await load(STORAGE.width, 420);
+		// Read with a null default so a genuinely stored width is distinguishable
+		// from never having set one -- otherwise the mobile default below could
+		// never apply.
+		const savedWidth = await load(STORAGE.width, null);
+
+		if (typeof savedWidth === "number" && Number.isFinite(savedWidth)) {
+			return savedWidth;
+		}
+
+		// Dragging the resize handle on a touch screen is fiddly, so open at three
+		// quarters of the viewport rather than leaving that to be corrected by hand.
+		return isMobile() ? Math.round(window.innerWidth * 0.75) : 420;
 	}
 
 	async function saveSiteWidth(width) {
@@ -233,6 +270,81 @@
 	}
 
 	// -------------------------
+	// Remembered votes
+	// -------------------------
+
+	// Mirrors the persisted map so render paths stay synchronous. Populated once
+	// at startup by loadRememberedVotes().
+	let rememberedVotes = {};
+
+	async function loadRememberedVotes() {
+		const stored = await load(STORAGE.votes, {});
+		const now = Date.now();
+		const kept = {};
+		let expired = 0;
+
+		if (stored && typeof stored === "object" && !Array.isArray(stored)) {
+			for (const [itemId, record] of Object.entries(stored)) {
+				if (!record || typeof record !== "object" || !record.state) {
+					continue;
+				}
+
+				if (Number.isFinite(record.ts) && now - record.ts > VOTE_MEMORY_TTL) {
+					expired++;
+					continue;
+				}
+
+				kept[itemId] = record;
+			}
+		}
+
+		rememberedVotes = kept;
+
+		if (expired) {
+			await save(STORAGE.votes, kept);
+		}
+	}
+
+	function rememberVote(itemId, voteInfo) {
+		const key = String(itemId);
+		const state = voteInfo?.state;
+
+		if (state === "up" || state === "down") {
+			rememberedVotes[key] = {
+				state,
+				// Kept so the vote can still be undone later: HN does not render an
+				// unvote link on a plain page load, and the arrow it does render for
+				// something already voted on carries no auth token.
+				unUrl: voteInfo.unUrl || null,
+				ts: Date.now(),
+			};
+		} else if (!(key in rememberedVotes)) {
+			return;
+		} else {
+			delete rememberedVotes[key];
+		}
+
+		save(STORAGE.votes, rememberedVotes).catch(console.error);
+	}
+
+	// Replays what the popup told us over a page HN served anonymously.
+	function applyRememberedVotes(voteLinks) {
+		for (const [itemId, record] of Object.entries(rememberedVotes)) {
+			const entry = voteLinks.get(itemId);
+
+			if (!entry) {
+				continue;
+			}
+
+			// A fetched page cannot contradict this: it never sees any vote at all.
+			entry.state = record.state;
+			entry.unUrl = entry.unUrl || record.unUrl;
+		}
+
+		return voteLinks;
+	}
+
+	// -------------------------
 	// Network
 	// -------------------------
 
@@ -264,7 +376,29 @@
 		});
 	}
 
+	function requestText(url) {
+		return new Promise((resolve) => {
+			GM.xmlHttpRequest({
+				method: "GET",
+				url,
+				timeout: 10000,
+				anonymous: false,
+				onload: function (response) {
+					resolve(response.responseText || "");
+				},
+				onerror: function () {
+					resolve("");
+				},
+				ontimeout: function () {
+					resolve("");
+				},
+			});
+		});
+	}
+
 	const itemCache = new Map();
+	const voteLinkCache = new Map();
+	const voteBridgeRequests = new Map();
 
 	async function getItem(id) {
 		if (itemCache.has(id)) {
@@ -335,22 +469,23 @@
 	function normalizeURL(url) {
 		try {
 			const u = new URL(url);
+			const keysToRemove = [];
 
-			[
-				"utm_source",
-				"utm_medium",
-				"utm_campaign",
-				"utm_term",
-				"utm_content",
-				"fbclid",
-				"gclid",
-			].forEach((param) => u.searchParams.delete(param));
+			for (const key of u.searchParams.keys()) {
+				if (TRACKING_PARAMS.has(key.toLowerCase())) {
+					keysToRemove.push(key);
+				}
+			}
+
+			for (const key of keysToRemove) {
+				u.searchParams.delete(key);
+			}
 
 			return (
-				u.hostname +
+				u.hostname.toLowerCase() +
 				u.pathname.replace(/\/$/, "") +
 				u.search
-			).toLowerCase();
+			);
 		} catch {
 			return "";
 		}
@@ -572,7 +707,662 @@
 	}
 
 	function commentURL(storyID) {
-		return "https://news.ycombinator.com/item?id=" + storyID;
+		return HN_ORIGIN + "/item?id=" + storyID;
+	}
+
+	function normalizeVoteURL(href) {
+		if (!href) {
+			return null;
+		}
+
+		try {
+			const url = new URL(href, HN_ORIGIN + "/");
+
+			if (url.origin !== HN_ORIGIN || url.pathname !== "/vote") {
+				return null;
+			}
+
+			return url.href;
+		} catch {
+			return null;
+		}
+	}
+
+	function cloneVoteInfo(voteInfo) {
+		if (!voteInfo) {
+			return null;
+		}
+
+		return {
+			upUrl: voteInfo.upUrl || null,
+			downUrl: voteInfo.downUrl || null,
+			unUrl: voteInfo.unUrl || null,
+			state: voteInfo.state || "none",
+			hasAuth: Boolean(voteInfo.hasAuth),
+		};
+	}
+
+	function extractVoteLinksFromRoot(root) {
+		const voteLinks = new Map();
+
+		root.querySelectorAll("a[id]").forEach((anchor) => {
+			const match = /^(up|down|un)_(\d+)$/.exec(anchor.id || "");
+
+			if (!match) {
+				return;
+			}
+
+			const [, action, itemId] = match;
+			const voteURL = normalizeVoteURL(anchor.getAttribute("href"));
+
+			if (!voteURL) {
+				return;
+			}
+
+			const entry = voteLinks.get(itemId) || {
+				upUrl: null,
+				downUrl: null,
+				unUrl: null,
+				state: "none",
+				hasAuth: false,
+			};
+
+			const hasAuth = new URL(voteURL).searchParams.has("auth");
+			entry.hasAuth = entry.hasAuth || hasAuth;
+			const hidden = (anchor.className || "").split(/\s+/).includes("nosee");
+
+			if (action === "up") {
+				entry.upUrl = voteURL;
+				// hn.js does vis($('up_'+id), how == 'un'), i.e. it marks the arrows
+				// `nosee` once you have voted. That is the only signal present on a
+				// plain page load of something voted on earlier, since the unvote
+				// link below is injected client-side at vote time.
+				entry.upHidden = hidden;
+			} else if (action === "down") {
+				entry.downUrl = voteURL;
+				entry.downHidden = hidden;
+			} else {
+				entry.unUrl = voteURL;
+
+				// When an unvote link is present its label is authoritative about
+				// direction: "undown" removes a downvote, "unvote" an upvote.
+				if (!hidden) {
+					const label = (anchor.textContent || "").trim().toLowerCase();
+					entry.state = label.includes("undown") ? "down" : "up";
+				}
+			}
+
+			voteLinks.set(itemId, entry);
+		});
+
+		for (const entry of voteLinks.values()) {
+			// No unvote link rendered, so fall back to which arrow HN hid. One arrow
+			// hidden while the other shows names the direction outright. Both hidden
+			// only says a vote exists -- hn.js hides the pair either way -- so upvote
+			// is the assumption there, downvoting needing karma most accounts lack.
+			if (entry.state === "none") {
+				if (entry.upHidden && !entry.downHidden) {
+					entry.state = "up";
+				} else if (entry.downHidden && !entry.upHidden) {
+					entry.state = "down";
+				} else if (entry.upHidden && entry.downHidden) {
+					entry.state = "up";
+				}
+			}
+
+			// hn.js builds the unvote href as vurl(id, 'un', auth, goto), reusing
+			// the very same auth token as the up/down link, so when HN did not
+			// render an unvote link it can be derived from whichever arrow is here.
+			// Null when HN offered no unvote link and no arrow with a usable token,
+			// which is the already-voted-in-an-earlier-session case. The unvote
+			// control is simply withheld rather than rendered dead.
+			if (entry.state !== "none" && !entry.unUrl) {
+				entry.unUrl = deriveUnvoteURL(entry.upUrl || entry.downUrl);
+			}
+
+			// Kept off the shape cloneVoteInfo copies, but tidy up regardless.
+			delete entry.upHidden;
+			delete entry.downHidden;
+		}
+
+		return voteLinks;
+	}
+
+	// HN renders the real tally as <span class="score" id="score_123">45 points</span>.
+	// Reading it beats adding one to a cached Firebase score, which drifts as other
+	// people vote and is what made the sidebar count disagree with HN.
+	function extractScoreFromRoot(root, itemId) {
+		const element = root.querySelector(`[id="score_${String(itemId)}"]`);
+
+		if (!element) {
+			return null;
+		}
+
+		const match = /-?\d+/.exec(element.textContent || "");
+
+		return match ? Number(match[0]) : null;
+	}
+
+	function deriveUnvoteURL(voteURL) {
+		if (!voteURL) {
+			return null;
+		}
+
+		try {
+			const url = new URL(voteURL);
+
+			// HN renders the already-used arrow hidden and without an auth token, and
+			// it ignores a vote that carries none. Deriving from one of those would
+			// produce an unvote control that silently does nothing, so refuse.
+			if (!url.searchParams.get("auth")) {
+				return null;
+			}
+
+			url.searchParams.set("how", "un");
+			return url.href;
+		} catch {
+			return null;
+		}
+	}
+
+	function invalidateVoteLinks(storyID) {
+		voteLinkCache.delete(String(storyID));
+	}
+
+	function getVoteStateValue(voteInfo) {
+		if (!voteInfo) {
+			return 0;
+		}
+
+		if (voteInfo.state === "up") {
+			return 1;
+		}
+
+		if (voteInfo.state === "down") {
+			return -1;
+		}
+
+		if (voteInfo.state === "none") {
+			return 0;
+		}
+
+		return null;
+	}
+
+	// Mirrors HN's own byline: once a vote is in, the arrow disappears and an
+	// unvote link takes its place -- "unvote" after an upvote, "undown" after a
+	// downvote. Clicking it removes the vote.
+	function updateVoteStatus(itemId, state, onUnvote) {
+		const label =
+			state === "up" ? "unvote" : state === "down" ? "undown" : null;
+
+		const escapedId = CSS.escape(String(itemId));
+		const selector =
+			`.story-vote-status[data-vote-status-id="${escapedId}"],` +
+			`.comment-vote-status[data-vote-status-id="${escapedId}"]`;
+
+		// Scoped to the sidebar's shadow root: document.querySelector cannot
+		// cross that boundary and would silently match nothing.
+		(sidebarUI?.body?.querySelectorAll(selector) || []).forEach((element) => {
+			element.replaceChildren();
+
+			if (!label) {
+				return;
+			}
+
+			element.appendChild(document.createTextNode(" | "));
+
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "vote-unvote-link";
+			button.textContent = label;
+
+			button.onclick = (event) => {
+				event.preventDefault();
+				event.stopPropagation();
+				onUnvote?.();
+			};
+
+			element.appendChild(button);
+		});
+	}
+
+	function updateCachedStoryScore(storyID, score) {
+		const numericScore = Number(score);
+
+		if (!Number.isFinite(numericScore)) {
+			return;
+		}
+
+		for (const key of [String(storyID), Number(storyID)]) {
+			if (!itemCache.has(key)) {
+				continue;
+			}
+
+			const item = itemCache.get(key);
+
+			if (item && typeof item === "object") {
+				item.score = numericScore;
+			}
+		}
+	}
+
+	function updateStoryScoreDisplay(storyID, score) {
+		const numericScore = Math.max(0, Math.round(Number(score)));
+
+		if (!Number.isFinite(numericScore)) {
+			return;
+		}
+
+		sidebarUI?.body
+			?.querySelectorAll(`[data-story-score-id="${String(storyID)}"]`)
+			.forEach((element) => {
+				element.dataset.storyScore = String(numericScore);
+				element.textContent = String(numericScore);
+			});
+	}
+
+	function maybeUpdateStoryScoreFromVoteChange(storyID, itemId, previousVoteInfo, nextVoteInfo) {
+		if (String(storyID) !== String(itemId)) {
+			return;
+		}
+
+		const previousValue = getVoteStateValue(previousVoteInfo);
+		const nextValue = getVoteStateValue(nextVoteInfo);
+
+		if (previousValue == null || nextValue == null || previousValue === nextValue) {
+			return;
+		}
+
+		const scoreElement = sidebarUI?.body?.querySelector(
+			`[data-story-score-id="${String(storyID)}"]`,
+		);
+		const displayedScore = Number(
+			scoreElement?.dataset.storyScore || scoreElement?.textContent,
+		);
+		const cachedItem = itemCache.get(String(storyID)) || itemCache.get(Number(storyID));
+		const cachedScore = Number(cachedItem?.score);
+		const currentScore = Number.isFinite(displayedScore)
+			? displayedScore
+			: cachedScore;
+
+		if (!Number.isFinite(currentScore)) {
+			return;
+		}
+
+		const nextScore = Math.max(0, currentScore + (nextValue - previousValue));
+		updateCachedStoryScore(storyID, nextScore);
+		updateStoryScoreDisplay(storyID, nextScore);
+	}
+
+	function setVoteInfoForStoryItem(
+		storyID,
+		itemId,
+		voteInfo,
+		authoritativeScore,
+	) {
+		const cacheKey = String(storyID);
+		const cached = voteLinkCache.get(cacheKey);
+		const nextVoteLinks = cached instanceof Map ? new Map(cached) : new Map();
+		const previousVoteInfo = nextVoteLinks.get(String(itemId)) || null;
+
+		if (voteInfo) {
+			const merged = cloneVoteInfo(voteInfo);
+
+			// The popup owns the vote state, but it reports from the item's own
+			// permalink, which can carry a downvote arrow the story listing never
+			// showed. Whichever arrows the sidebar already had win outright -- not
+			// `previous || popup`, since falling back still lets the permalink's
+			// extra arrow through and makes a ▼ appear on unvote that was never
+			// there before the vote.
+			if (previousVoteInfo) {
+				merged.upUrl = previousVoteInfo.upUrl;
+				merged.downUrl = previousVoteInfo.downUrl;
+			}
+
+			nextVoteLinks.set(String(itemId), merged);
+		} else {
+			nextVoteLinks.delete(String(itemId));
+		}
+
+		voteLinkCache.set(cacheKey, nextVoteLinks);
+
+		// Prefer HN's own tally when the popup managed to read it. The +/-1
+		// estimate below drifts as soon as anyone else has voted since the sidebar
+		// loaded, which is what made the count disagree with Hacker News.
+		if (Number.isFinite(authoritativeScore)) {
+			updateCachedStoryScore(storyID, authoritativeScore);
+			updateStoryScoreDisplay(storyID, authoritativeScore);
+		} else {
+			maybeUpdateStoryScoreFromVoteChange(
+				storyID,
+				itemId,
+				previousVoteInfo,
+				voteInfo || null,
+			);
+		}
+
+		hydrateVoteControlsForStory(storyID, nextVoteLinks);
+	}
+
+	async function loadVoteLinks(storyID, options = {}) {
+		const cacheKey = String(storyID);
+		const cached = voteLinkCache.get(cacheKey);
+
+		if (!options.force && cached) {
+			return await cached;
+		}
+
+		const promise = (async () => {
+			const html = await requestText(commentURL(storyID));
+
+			if (!html) {
+				return new Map();
+			}
+
+			const doc = new DOMParser().parseFromString(html, "text/html");
+
+			const trueScore = extractScoreFromRoot(doc, storyID);
+
+			if (Number.isFinite(trueScore)) {
+				updateCachedStoryScore(storyID, trueScore);
+				updateStoryScoreDisplay(storyID, trueScore);
+			}
+
+			return applyRememberedVotes(extractVoteLinksFromRoot(doc));
+		})();
+
+		voteLinkCache.set(cacheKey, promise);
+
+		try {
+			const voteLinks = await promise;
+			voteLinkCache.set(cacheKey, voteLinks);
+			return voteLinks;
+		} catch {
+			voteLinkCache.delete(cacheKey);
+			return new Map();
+		}
+	}
+
+	function getVoteDescriptors(voteInfo) {
+		if (!voteInfo) {
+			return [];
+		}
+
+		const descriptors = [];
+
+		if (voteInfo.state === "up" && voteInfo.unUrl) {
+			descriptors.push({
+				label: "▲",
+				title: "Remove upvote on Hacker News",
+				action: "un",
+				url: voteInfo.unUrl,
+				active: true,
+				variant: "up",
+			});
+		} else if (voteInfo.upUrl) {
+			descriptors.push({
+				label: "▲",
+				title: "Upvote on Hacker News",
+				action: "up",
+				url: voteInfo.upUrl,
+				active: false,
+				variant: "up",
+			});
+		}
+
+		if (voteInfo.state === "down" && voteInfo.unUrl) {
+			descriptors.push({
+				label: "▼",
+				title: "Remove downvote on Hacker News",
+				action: "un",
+				url: voteInfo.unUrl,
+				active: true,
+				variant: "down",
+			});
+		} else if (voteInfo.downUrl) {
+			descriptors.push({
+				label: "▼",
+				title: "Downvote on Hacker News",
+				action: "down",
+				url: voteInfo.downUrl,
+				active: false,
+				variant: "down",
+			});
+		}
+
+		if (!descriptors.length && voteInfo.unUrl) {
+			descriptors.push({
+				label: "↺",
+				title: "Remove vote on Hacker News",
+				action: "un",
+				url: voteInfo.unUrl,
+				active: true,
+				variant: "neutral",
+			});
+		}
+
+		return descriptors;
+	}
+
+	function voteBridgePageURL(storyID, itemId, action, voteURL, nonce) {
+		const url = new URL(commentURL(itemId));
+		const hash = new URLSearchParams();
+		hash.set("hnewhere-vote", "1");
+		hash.set("story", String(storyID));
+		hash.set("item", String(itemId));
+		hash.set("action", action);
+
+		// Carried through because the popup cannot always find the anchor itself:
+		// hn.js injects the un_ unvote link client-side at vote time, so it is
+		// absent from a freshly loaded page and getElementById finds nothing.
+		if (voteURL) {
+			hash.set("voteURL", voteURL);
+		}
+
+		hash.set("origin", location.origin);
+		hash.set("nonce", nonce);
+		url.hash = hash.toString();
+		return url.href;
+	}
+
+	function setupVoteBridgeListener() {
+		if (window.__hnewhereVoteBridgeListenerInstalled) {
+			return;
+		}
+
+		window.__hnewhereVoteBridgeListenerInstalled = true;
+		window.addEventListener("message", (event) => {
+			if (event.origin !== HN_ORIGIN) {
+				return;
+			}
+
+			const data = event.data;
+
+			if (!data || data.source !== VOTE_BRIDGE_MESSAGE_SOURCE || !data.nonce) {
+				return;
+			}
+
+			// The popup read HN as a real logged-in page, so its result stands.
+			// Deliberately no refetch to reconcile afterwards: that returned a stale
+			// score and a state that reported no vote, which visibly undid the vote a
+			// moment after it landed.
+			if (data.storyID && data.itemId && data.voteInfo) {
+				rememberVote(data.itemId, data.voteInfo);
+				setVoteInfoForStoryItem(
+					data.storyID,
+					data.itemId,
+					data.voteInfo,
+					data.score,
+				);
+			}
+
+			const pending = voteBridgeRequests.get(data.nonce);
+
+			if (!pending) {
+				return;
+			}
+
+			clearTimeout(pending.timeoutId);
+			voteBridgeRequests.delete(data.nonce);
+
+			try {
+				pending.popup?.close();
+			} catch {}
+
+			pending.resolve(data);
+		});
+	}
+
+	function openVoteBridgePopup(storyID, itemId, action, voteURL) {
+		setupVoteBridgeListener();
+
+		return new Promise((resolve) => {
+			const nonce =
+				String(Date.now()) + Math.random().toString(36).slice(2, 10);
+			const bridgeURL = voteBridgePageURL(
+				storyID,
+				itemId,
+				action,
+				voteURL,
+				nonce,
+			);
+			const popup = window.open(
+				bridgeURL,
+				"hnewhere_vote_bridge_" + nonce,
+				"width=420,height=320,resizable=yes,scrollbars=yes",
+			);
+
+			if (!popup) {
+				resolve({ ok: false, reason: "popup-blocked" });
+				return;
+			}
+
+			// Deliberately does NOT close the popup. The vote is a navigation now,
+			// and closing mid-flight aborts it -- the very bug that stopped votes
+			// persisting. On timeout just unblock the sidebar and let the popup
+			// finish and close itself. The window covers two page loads (the vote
+			// and HN's redirect back), so it is generous.
+			const timeoutId = window.setTimeout(() => {
+				voteBridgeRequests.delete(nonce);
+				resolve({ ok: false, reason: "timeout" });
+			}, 12000);
+
+			voteBridgeRequests.set(nonce, {
+				resolve,
+				timeoutId,
+				popup,
+			});
+		});
+	}
+
+	async function submitVote(storyID, itemId, descriptor, container) {
+		if (!container || container.dataset.votePending === "1") {
+			return;
+		}
+
+		container.dataset.votePending = "1";
+		container.classList.add("vote-controls-pending");
+		container.querySelectorAll(".vote-button").forEach((button) => {
+			button.disabled = true;
+		});
+
+		try {
+			const result = await openVoteBridgePopup(
+				storyID,
+				itemId,
+				descriptor.action,
+				descriptor.url,
+			);
+
+			if (result?.storyID && result?.itemId && result?.voteInfo) {
+				setVoteInfoForStoryItem(result.storyID, result.itemId, result.voteInfo);
+			}
+		} finally {
+			delete container.dataset.votePending;
+			container.classList.remove("vote-controls-pending");
+			container.querySelectorAll(".vote-button").forEach((button) => {
+				button.disabled = false;
+			});
+		}
+	}
+
+	function renderVoteControls(container, storyID, itemId, voteInfo) {
+		if (!container) {
+			return;
+		}
+
+		container.replaceChildren();
+
+		const descriptors = getVoteDescriptors(voteInfo);
+		const state = voteInfo?.state;
+		const hasVote = state === "up" || state === "down";
+
+		// Only offer the link when there is a URL behind it, so it never renders
+		// as something that looks clickable but does nothing.
+		updateVoteStatus(itemId, voteInfo?.unUrl ? state : null, () => {
+			submitVote(
+				storyID,
+				itemId,
+				{ action: "un", url: voteInfo.unUrl },
+				container,
+			);
+		});
+
+		// HN hides the arrows entirely once you have voted; the unvote link in the
+		// byline becomes the only control.
+		if (!descriptors.length || hasVote) {
+			container.classList.add("hidden");
+			return;
+		}
+
+		container.classList.remove("hidden");
+
+		for (const descriptor of descriptors) {
+			const button = document.createElement("button");
+			button.type = "button";
+			button.className = "vote-button";
+			button.title = descriptor.title;
+			button.setAttribute("aria-label", descriptor.title);
+
+			if (descriptor.variant === "neutral") {
+				button.classList.add("vote-button-neutral");
+				button.textContent = descriptor.label;
+			} else {
+				button.textContent = "";
+			}
+
+			if (descriptor.active) {
+				button.classList.add("vote-button-active");
+			}
+
+			if (descriptor.variant) {
+				button.classList.add("vote-button-" + descriptor.variant);
+			}
+
+			button.onclick = async (event) => {
+				event.preventDefault();
+				event.stopPropagation();
+				await submitVote(storyID, itemId, descriptor, container);
+			};
+
+			container.appendChild(button);
+		}
+	}
+
+	function hydrateVoteControlsForStory(storyID, voteLinks = new Map()) {
+		const containers = sidebarUI?.body?.querySelectorAll(
+			`[data-hn-vote-story-id="${String(storyID)}"]`,
+		);
+
+		if (!containers?.length) {
+			return;
+		}
+
+		for (const container of containers) {
+			const itemId = container.dataset.hnVoteItemId;
+			renderVoteControls(container, storyID, itemId, voteLinks.get(String(itemId)));
+		}
 	}
 
 	// -------------------------
@@ -712,6 +1502,8 @@
 		if (restoreButton) {
 			destroyFloatingButton(restoreButton);
 		}
+
+		ensureVoteControlsLoaded().catch(console.error);
 
 		return wasHidden;
 	}
@@ -870,16 +1662,21 @@ header button:hover {
     background:rgba(0,0,0,.08);
 }
 
+
 .header-actions {
     display:flex;
     align-items:center;
-    gap:4px;
+    gap:0;
 }
 
+/* The 36px buttons already centre their glyphs, so the visual inset on the right
+   is the 8px header padding plus roughly half the leftover button width. This
+   mirrors that on the left rather than letting the title hug the edge. */
 .header-title {
     display:flex;
     flex-direction:column;
     min-width:0;
+    padding-left:12px;
 }
 
 .header-subtitle {
@@ -922,6 +1719,16 @@ header button:hover {
     font-weight:700;
     letter-spacing:.04em;
     text-transform:uppercase;
+}
+
+/* U+2699 defaults to its emoji presentation on iOS. font-variant-emoji is the
+   stated way to ask for the text glyph but only lands in Safari 17+, and
+   system-ui alone does not help because iOS still resolves the codepoint through
+   Apple Color Emoji. The U+FE0E variation selector in the markup is what actually
+   forces it; these remain as support for browsers that honour them. */
+#settings-toggle {
+    font-family: system-ui, sans-serif;
+    font-variant-emoji: text;
 }
 
 .settings-option {
@@ -969,7 +1776,7 @@ header button:hover {
     overflow:auto;
     overflow-x:hidden;
 			overscroll-behavior:contain;
-    padding:8px 12px;
+    padding:12px 12px 8px;
     word-wrap:break-word;
 }
 
@@ -1124,6 +1931,157 @@ header button:hover {
     text-decoration:underline;
 }
 
+.vote-controls {
+    display:flex;
+    flex-direction:column;
+    align-items:center;
+    width:17px;
+}
+
+.story-table {
+    width:100%;
+    border-collapse:collapse;
+    table-layout:fixed;
+}
+
+.story-table td {
+    padding:0;
+    vertical-align:top;
+}
+
+.story-votelinks,
+.story-votespacer {
+    width:14px;
+}
+
+.story-votelinks {
+    text-align:center;
+}
+
+.story-votelinks .vote-controls {
+    margin-top:3px;
+}
+
+.story-title-cell,
+.story-body-cell {
+    padding-left:2px;
+}
+
+.comment-layout {
+    display:flex;
+    align-items:flex-start;
+}
+
+.comment-vote-slot {
+    flex:0 0 17px;
+    width:17px;
+    display:flex;
+    justify-content:center;
+    align-items:flex-start;
+    padding-top:1px;
+}
+
+.comment-main {
+    flex:1 1 auto;
+    min-width:0;
+}
+
+.vote-button {
+    position:relative;
+    width:10px;
+    height:10px;
+    min-width:10px;
+    border:none;
+    background:none;
+    padding:0;
+    margin:0;
+    color:transparent;
+    cursor:pointer;
+    font-size:0;
+    line-height:1;
+}
+
+.vote-button::before {
+    content:"";
+    position:absolute;
+    left:1px;
+    top:1px;
+    width:0;
+    height:0;
+    border-left:4px solid transparent;
+    border-right:4px solid transparent;
+    border-bottom:7px solid #828282;
+}
+
+.vote-button-down::before {
+    border-bottom:none;
+    border-top:7px solid #828282;
+    top:2px;
+}
+
+.vote-button:hover::before,
+.vote-button-active::before {
+    border-bottom-color:#ff6600;
+}
+
+.vote-button-down:hover::before {
+    border-top-color:#ff6600;
+}
+
+.vote-button-down.vote-button-active::before {
+    border-top-color:#666;
+}
+
+.vote-button-neutral {
+    width:auto;
+    min-width:10px;
+    height:auto;
+    color:#828282;
+    font:600 10px/1 Verdana, Geneva, sans-serif;
+}
+
+.vote-button-neutral::before {
+    content:none;
+}
+
+.vote-button-neutral:hover,
+.vote-button-neutral.vote-button-active {
+    color:#ff6600;
+}
+
+.vote-button + .vote-button {
+    margin-top:2px;
+}
+
+.vote-button:disabled {
+    opacity:.55;
+    cursor:default;
+}
+
+.story-vote-status,
+.comment-vote-status {
+    color:#828282;
+}
+
+/* Sits in the byline as plain text, the way HN's own unvote link does. */
+.vote-unvote-link {
+    background:none;
+    border:0;
+    padding:0;
+    margin:0;
+    color:inherit;
+    font:inherit;
+    cursor:pointer;
+}
+
+.vote-unvote-link:hover {
+    text-decoration:underline;
+}
+
+.vote-controls-pending {
+    opacity:.7;
+}
+
 .comment-quote-link {
     color:inherit;
     cursor:pointer;
@@ -1193,17 +2151,20 @@ blockquote.comment-quote-redundant {
 
 .story-title {
     font-size:15px;
+    line-height:1.25;
 }
 
 .story-title a {
     color:#000;
     text-decoration:none;
+    word-break:break-word;
 }
 
 .story-meta {
     color:#828282;
     font-size:10px;
     line-height:1.4;
+    padding-top:2px;
 }
 
 .story-text {
@@ -1225,6 +2186,10 @@ blockquote.comment-quote-redundant {
 
 .story-actions {
     margin-top:8px;
+    display:flex;
+    align-items:center;
+    gap:8px;
+    flex-wrap:wrap;
 }
 
 .story-actions button {
@@ -1246,7 +2211,7 @@ blockquote.comment-quote-redundant {
 
 <div class="header-actions">
 <button id="settings-toggle" aria-label="Open HNewhere settings" title="HNewhere settings">
-⚙
+&#9881;&#65038;
 </button>
 
 <button id="minimize" aria-label="Minimize HNewhere" title="Minimize">
@@ -1514,63 +2479,67 @@ blockquote.comment-quote-redundant {
 			return null;
 		}
 
+		const storyID = String(story.id);
 		const hnURL = commentURL(story.id);
 
 		const wrapper = document.createElement("div");
 		wrapper.innerHTML = `
 
-<div class="story">
-
-<div class="story-title">
-
-<a target="_blank"
-href="${escapeHTML(hnURL)}"
-title="Open discussion on Hacker News">
-
-${escapeHTML(story.title)}
-
-</a>
-</div>
-
-<div class="story-meta">
-
-${story.score || 0} points by
-
-${escapeHTML(story.by || "")}
-
-|
-
-${timeAgo(story.time)}
-
-|
-
-${story.descendants || 0} comments
-
-</div>
-
-${
-	story.text
-		? `
-<div class="story-text">
-${sanitizeHTML(story.text)}
-</div>
-`
-		: ""
-}
-
-<div class="story-actions">
-
-<button type="submit" class="add-comment">
-add comment
-</button>
-
-</div>
-</div>
+	<div class="story">
+	<table class="story-table" role="presentation">
+	<tbody>
+	<tr>
+	<td class="story-votelinks">
+	<span class="story-vote-controls vote-controls hidden"
+	data-hn-vote-story-id="${escapeHTML(storyID)}"
+	data-hn-vote-item-id="${escapeHTML(storyID)}"></span>
+	</td>
+	<td class="story-title-cell">
+	<div class="story-title">
+	<a target="_blank"
+	href="${escapeHTML(hnURL)}"
+	title="Open discussion on Hacker News">
+	${escapeHTML(story.title)}
+	</a>
+	</div>
+	</td>
+	</tr>
+	<tr>
+	<td class="story-votespacer"></td>
+	<td class="story-body-cell">
+	<div class="story-meta">
+	<span class="story-score" data-story-score-id="${escapeHTML(storyID)}" data-story-score="${escapeHTML(String(story.score || 0))}">${story.score || 0}</span> points by
+	${escapeHTML(story.by || "")}
+	|
+	${timeAgo(story.time)}<span class="story-vote-status" data-vote-status-id="${escapeHTML(storyID)}"></span>
+	|
+	${story.descendants || 0} comments
+	</div>
+	${
+		story.text
+			? `
+	<div class="story-text">
+	${sanitizeHTML(story.text)}
+	</div>
+	`
+			: ""
+	}
+	<div class="story-actions">
+	<button type="submit" class="add-comment">
+	add comment
+	</button>
+	</div>
+	</td>
+	</tr>
+	</tbody>
+	</table>
+	</div>
 
 <br>
 
 `;
 		const storyElement = wrapper.firstElementChild;
+		storyElement.dataset.storyId = storyID;
 		container.appendChild(storyElement);
 
 		storyElement.querySelector(".add-comment").onclick = () => {
@@ -1673,8 +2642,17 @@ add comment
 
 		const replies = comment.kids || [];
 		const reply = replyURL(comment, storyID);
+		const commentID = String(comment.id);
 
 		div.innerHTML = `
+      <div class="comment-layout">
+      <span class="comment-vote-slot">
+      <span class="comment-vote-controls vote-controls hidden"
+      data-hn-vote-story-id="${escapeHTML(String(storyID))}"
+      data-hn-vote-item-id="${escapeHTML(commentID)}"></span>
+      </span>
+
+      <div class="comment-main">
       <div class="meta">
 
       <a target="_blank"
@@ -1685,12 +2663,12 @@ add comment
       </a>
 
       ${
-				comment.by && comment.by === storyAuthor
-					? `<span class="op-pill">OP</span>`
-					: ""
-			}
+					comment.by && comment.by === storyAuthor
+						? `<span class="op-pill">OP</span>`
+						: ""
+				}
 
-      ${timeAgo(comment.time)}
+      ${timeAgo(comment.time)}<span class="comment-vote-status" data-vote-status-id="${escapeHTML(commentID)}"></span>
 
       |
 
@@ -1709,6 +2687,8 @@ add comment
         		${sanitizeHTML(comment.text) || ""}
        	</div>
        	<div class="children"></div>
+      </div>
+      </div>
       </div>
     `;
 
@@ -1797,6 +2777,8 @@ add comment
 		ui.body.innerHTML = "";
 		ui.headerSubtitle.textContent = "";
 
+		const generation = sidebarGeneration;
+		const votePromise = isSidebarVisible() ? loadVoteLinks(story.id) : null;
 		const storyElement = renderStory(story, ui.body);
 		mountFilterBanner(storyElement, ui);
 
@@ -1817,6 +2799,10 @@ add comment
 		);
 
 		await markSeen(story.id);
+
+		if (votePromise && generation === sidebarGeneration) {
+			hydrateVoteControlsForStory(story.id, await votePromise);
+		}
 	}
 
 	async function renderBlendedDiscussion(stories, ui) {
@@ -1826,7 +2812,10 @@ add comment
 		ui.body.innerHTML = "";
 		ui.headerSubtitle.textContent = pluralize(stories.length, "submission") + " on HN";
 
+		const generation = sidebarGeneration;
+
 		for (const [index, story] of stories.entries()) {
+			const votePromise = isSidebarVisible() ? loadVoteLinks(story.id) : null;
 			const section = document.createElement("div");
 			section.className = "submission";
 			section.dataset.storyId = String(story.id);
@@ -1860,6 +2849,10 @@ add comment
 			);
 
 			await markSeen(story.id);
+
+			if (votePromise && generation === sidebarGeneration) {
+				hydrateVoteControlsForStory(story.id, await votePromise);
+			}
 		}
 	}
 
@@ -1936,8 +2929,196 @@ add comment
 	}
 
 	// -------------------------
-	// Hacker News click tracking
+	// Hacker News click tracking / vote bridge
 	// -------------------------
+
+	function parseVoteBridgePayload() {
+		const hash = location.hash.replace(/^#/, "");
+
+		if (!hash) {
+			return null;
+		}
+
+		const params = new URLSearchParams(hash);
+
+		if (params.get("hnewhere-vote") !== "1") {
+			return null;
+		}
+
+		const storyID = params.get("story");
+		const itemId = params.get("item");
+		const action = params.get("action");
+		const origin = params.get("origin");
+		const nonce = params.get("nonce");
+
+		if (!storyID || !itemId || !nonce) {
+			return null;
+		}
+
+		if (!["up", "down", "un"].includes(action)) {
+			return null;
+		}
+
+		return {
+			storyID,
+			itemId,
+			action,
+			origin,
+			nonce,
+			// Re-validated rather than trusted: this arrives via the URL fragment
+			// and is about to be navigated to, so it must be a real HN vote URL.
+			voteURL: normalizeVoteURL(params.get("voteURL")),
+		};
+	}
+
+	function postVoteBridgeResult(payload, result) {
+		if (!window.opener) {
+			return;
+		}
+
+		try {
+			window.opener.postMessage(
+				{
+					source: VOTE_BRIDGE_MESSAGE_SOURCE,
+					storyID: payload.storyID,
+					itemId: payload.itemId,
+					action: payload.action,
+					nonce: payload.nonce,
+					...result,
+				},
+				payload.origin || "*",
+			);
+		} catch (error) {
+			console.error("Failed posting vote bridge result:", error);
+		}
+	}
+
+	function currentVoteInfoFor(itemId) {
+		return cloneVoteInfo(
+			extractVoteLinksFromRoot(document).get(String(itemId)) || null,
+		);
+	}
+
+	// Runs on the page HN redirects to after the vote is committed. The hash is
+	// gone by now, so the payload comes back out of sessionStorage.
+	function reportVoteResultAfterReload() {
+		// HN's /vote response is itself a page this script runs on, and at that
+		// point the redirect has not landed yet so the document carries no vote
+		// links. Reporting from there would consume the payload, post a null
+		// voteInfo and close the popup before the real state was ever read.
+		// Only report once the redirect has arrived at the item page.
+		if (location.pathname !== "/item") {
+			return false;
+		}
+
+		let stored = null;
+
+		try {
+			stored = window.sessionStorage.getItem(VOTE_BRIDGE_STORAGE_KEY);
+			// Cleared immediately: if anything below throws, a stale payload must
+			// not make the next HN page load try to report again.
+			window.sessionStorage.removeItem(VOTE_BRIDGE_STORAGE_KEY);
+		} catch {
+			return false;
+		}
+
+		if (!stored) {
+			return false;
+		}
+
+		let payload = null;
+
+		try {
+			payload = JSON.parse(stored);
+		} catch {
+			return false;
+		}
+
+		if (!payload?.itemId || !payload?.nonce) {
+			return false;
+		}
+
+		// Server-rendered state, so this is the vote HN actually holds.
+		const voteInfo = currentVoteInfoFor(payload.itemId);
+		const changed = voteInfo?.state !== payload.beforeState;
+
+		postVoteBridgeResult(payload, {
+			ok: changed,
+			reason: changed ? "updated" : "unchanged",
+			voteInfo,
+			// HN's own tally, read off the page it just served.
+			score: extractScoreFromRoot(document, payload.itemId),
+		});
+
+		window.setTimeout(() => window.close(), 60);
+		return true;
+	}
+
+	function maybeHandleHNVoteBridge() {
+		const payload = parseVoteBridgePayload();
+
+		if (!payload) {
+			return false;
+		}
+
+		const before = currentVoteInfoFor(payload.itemId);
+
+		// This page's own tokens come first. It was just loaded in a real logged-in
+		// tab, so its auth is fresh, whereas the URL the sidebar passed in may be
+		// minutes old and HN expires those ("Unknown or expired link"). The passed
+		// URL is only the fallback, for when this page offers nothing usable --
+		// notably an unvote, since hn.js injects the un_ link client-side at vote
+		// time and it is absent from a freshly loaded page.
+		const anchor = document.getElementById(
+			payload.action + "_" + payload.itemId,
+		);
+		const voteURL =
+			(anchor instanceof HTMLAnchorElement
+				? normalizeVoteURL(anchor.getAttribute("href"))
+				: null) ||
+			(payload.action === "un" ? before?.unUrl : null) ||
+			payload.voteURL;
+
+		if (!voteURL) {
+			postVoteBridgeResult(payload, {
+				ok: false,
+				reason: "vote-url-missing",
+				voteInfo: before,
+			});
+			window.setTimeout(() => window.close(), 80);
+			return true;
+		}
+
+		// Deliberately NOT voteAnchor.click(): HN's own handler updates the arrow
+		// optimistically and sends /vote in the background, so closing the popup
+		// moments later aborts the request and the vote never reaches the server.
+		// A top-level navigation cannot be aborted that way -- HN commits the vote
+		// and redirects to goto, and the state we read after is the real one.
+		const target = new URL(voteURL);
+		target.searchParams.set("goto", "item?id=" + payload.itemId);
+
+		try {
+			window.sessionStorage.setItem(
+				VOTE_BRIDGE_STORAGE_KEY,
+				JSON.stringify({
+					...payload,
+					beforeState: before?.state ?? "none",
+				}),
+			);
+		} catch (error) {
+			console.error("HNewhere: could not stage vote payload", error);
+			postVoteBridgeResult(payload, {
+				ok: false,
+				reason: "storage-unavailable",
+				voteInfo: before,
+			});
+			window.setTimeout(() => window.close(), 80);
+			return true;
+		}
+
+		location.href = target.href;
+		return true;
+	}
 
 	function setupHNListener() {
 		document.addEventListener(
@@ -2000,16 +3181,36 @@ add comment
 		);
 	}
 
+	function isSidebarVisible() {
+		return Boolean(sidebar && sidebar.style.display !== "none");
+	}
+
 	function shouldShowArticleAnnotations(settings) {
 		if (!settings.annotations) {
 			return false;
 		}
 
-		const sidebarVisible = Boolean(sidebar && sidebar.style.display !== "none");
-
-		return sidebarVisible
+		return isSidebarVisible()
 			? Boolean(settings.annotationsWhenSidebarOpen)
 			: Boolean(settings.annotationsWhenSidebarClosed);
+	}
+
+	async function ensureVoteControlsLoaded() {
+		if (!isSidebarVisible() || !sidebarUI?.body) {
+			return;
+		}
+
+		const storyIDs = [
+			...new Set(
+				[...sidebarUI.body.querySelectorAll("[data-hn-vote-story-id]")]
+					.map((element) => element.dataset.hnVoteStoryId)
+					.filter(Boolean),
+			),
+		];
+
+		for (const storyID of storyIDs) {
+			hydrateVoteControlsForStory(storyID, await loadVoteLinks(storyID));
+		}
 	}
 
 	// -------------------------
@@ -3350,11 +4551,23 @@ add comment
 	async function init() {
 		await migrateStorage();
 
-		// On HN, only record clicked stories.
+		// On HN, only record clicked stories and service popup vote actions.
 		if (location.hostname === "news.ycombinator.com") {
 			setupHNListener();
+
+			// Order matters: after the vote navigation the hash is gone and the
+			// payload is in sessionStorage, so the post-vote report has to be
+			// checked before treating this as a fresh bridge request.
+			if (reportVoteResultAfterReload()) {
+				return;
+			}
+
+			maybeHandleHNVoteBridge();
 			return;
 		}
+
+		// Before anything renders, so the first paint already knows what is voted.
+		await loadRememberedVotes();
 
 		const settings = await loadSettings();
 		const siteState = await loadSidebarState();
